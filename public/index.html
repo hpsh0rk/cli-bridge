@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cli-bridge 控制台</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px; font: 14px/1.6 -apple-system, "PingFang SC", sans-serif;
+    background: #f5f5f4; color: #1c1917;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #0c0a09; color: #e7e5e4; } }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 code { font-size: 13px; opacity: .6; font-weight: normal; }
+  .status { margin: 0 0 20px; padding: 6px 12px; border-radius: 8px; display: inline-block; font-size: 13px; }
+  .ok    { background: #dcfce7; color: #14532d; }
+  .bad   { background: #fee2e2; color: #7f1d1d; }
+  @media (prefers-color-scheme: dark) { .ok { background: #052e16; color: #bbf7d0; } .bad { background: #450a0a; color: #fecaca; } }
+  section { background: #fff; border: 1px solid #e7e5e4; border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  @media (prefers-color-scheme: dark) { section { background: #1c1917; border-color: #292524; } }
+  label { display: block; font-size: 12px; font-weight: 600; opacity: .75; margin: 12px 0 4px; }
+  input, textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid #d6d3d1; border-radius: 8px;
+    font: inherit; background: transparent; color: inherit;
+  }
+  @media (prefers-color-scheme: dark) { input, textarea, select { border-color: #44403c; } }
+  button {
+    padding: 8px 18px; border: 0; border-radius: 8px; font: inherit; font-weight: 600;
+    background: #1c1917; color: #fff; cursor: pointer; margin-top: 14px;
+  }
+  @media (prefers-color-scheme: dark) { button { background: #e7e5e4; color: #0c0a09; } }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost { background: transparent; color: inherit; border: 1px solid #d6d3d1; }
+  @media (prefers-color-scheme: dark) { button.ghost { border-color: #44403c; } }
+  .hint { font-size: 12px; opacity: .6; margin: 8px 0 0; }
+  .hint code { background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; }
+  .out {
+    margin: 14px 0 0; padding: 14px; border-radius: 8px; word-break: break-word;
+    background: #f5f5f4; font-size: 14px; min-height: 20px; overflow-x: auto;
+  }
+  @media (prefers-color-scheme: dark) { .out { background: #000; } }
+  .out.err { background: #fee2e2; white-space: pre-wrap; }
+  @media (prefers-color-scheme: dark) { .out.err { background: #450a0a; } }
+  .out p { margin: 0 0 10px; }
+  .out p:last-child { margin-bottom: 0; }
+  .out h1, .out h2, .out h3, .out h4 { margin: 14px 0 8px; line-height: 1.4; }
+  .out h1 { font-size: 18px; } .out h2 { font-size: 16px; } .out h3, .out h4 { font-size: 15px; }
+  .out code {
+    font: 12px ui-monospace, Menlo, monospace; background: rgba(127,127,127,.18);
+    padding: 1px 5px; border-radius: 4px;
+  }
+  .out pre {
+    background: rgba(127,127,127,.14); padding: 12px; border-radius: 8px; overflow-x: auto; margin: 10px 0;
+  }
+  .out pre code { background: transparent; padding: 0; }
+  .out ul, .out ol { margin: 8px 0; padding-left: 22px; }
+  .out li { margin: 3px 0; }
+  .out blockquote { margin: 8px 0; padding: 2px 12px; border-left: 3px solid rgba(127,127,127,.45); opacity: .9; }
+  .out a { color: #2563eb; }
+  @media (prefers-color-scheme: dark) { .out a { color: #93c5fd; } }
+  .out hr { border: 0; border-top: 1px solid rgba(127,127,127,.3); margin: 12px 0; }
+  .meta { font-size: 12px; opacity: .55; margin: 6px 0 0; }
+  .seg { display: inline-flex; border: 1px solid #d6d3d1; border-radius: 8px; overflow: hidden; }
+  @media (prefers-color-scheme: dark) { .seg { border-color: #44403c; } }
+  .segBtn {
+    margin: 0; border-radius: 0; border: 0; background: transparent; color: inherit;
+    font-weight: 600; padding: 6px 16px; cursor: pointer; opacity: .6;
+  }
+  .segBtn.active { background: rgba(127,127,127,.22); opacity: 1; }
+  .out img { max-width: 100%; border-radius: 8px; display: block; margin: 6px 0; }
+  .out img + img { margin-top: 10px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>cli-bridge 控制台 <code id="version"></code></h1>
+  <p id="status" class="status">正在检测本机桥…</p>
+
+  <section id="authBox">
+    <label for="token">桥 token</label>
+    <input id="token" type="password" placeholder="cb_…" autocomplete="off">
+    <button id="connectBtn">连接</button>
+    <p class="hint">没有 token？在终端执行 <code>cli-bridge token create --origin local</code>，把输出的 <code>cb_…</code> 粘贴到这里。token 只存本页 localStorage（按站点隔离），不会发往任何第三方。</p>
+  </section>
+
+  <section id="workBox" hidden>
+    <label for="tool">工具</label>
+    <select id="tool"></select>
+    <div id="modeBox" hidden>
+      <label>输出类型</label>
+      <div class="seg">
+        <button id="modeText" class="segBtn active">文本</button>
+        <button id="modeImage" class="segBtn">图片</button>
+      </div>
+      <p class="hint">图片模式走 OpenAI Images 协议（/v1/images/generations）；生成耗时数秒到数分钟，且依赖工具的图像配额。</p>
+    </div>
+    <label for="input">输入（prompt）</label>
+    <textarea id="input" rows="4" placeholder="要发给 CLI 工具的内容…（⌘/Ctrl + Enter 运行）"></textarea>
+    <button id="runBtn">运行</button>
+    <button id="cancelBtn" class="ghost" hidden>停止</button>
+    <div id="out" class="out">（结果会显示在这里，流式输出并渲染 Markdown）</div>
+    <p class="meta" id="meta"></p>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const state = { token: localStorage.getItem('bridge-token') || '', tools: [], running: false, raw: '', ctrl: null, mode: 'text', runId: null };
+
+function sniffMime(b64) {
+  if (b64.startsWith('/9j/')) return 'image/jpeg';
+  if (b64.startsWith('UklGR')) return 'image/webp';
+  if (b64.startsWith('R0lGOD')) return 'image/gif';
+  return 'image/png'; // PNG 魔数 iVBOR 及未知格式兜底
+}
+
+function setStatus(text, ok) {
+  $('status').textContent = text;
+  $('status').className = 'status ' + (ok ? 'ok' : 'bad');
+}
+
+// ── 轻量 Markdown 渲染（零依赖）：先整体转义防注入，再做行级转换 ──
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function inlineMd(s) {
+  return s
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+}
+function mdToHtml(src) {
+  const lines = escapeHtml(src).split('\n');
+  const out = [];
+  let inCode = false;
+  let codeBuf = [];
+  let listType = null;
+  let listBuf = [];
+  const flushList = () => {
+    if (!listType) return;
+    out.push('<' + listType + '>' + listBuf.map((li) => '<li>' + inlineMd(li) + '</li>').join('') + '</' + listType + '>');
+    listType = null;
+    listBuf = [];
+  };
+  for (const line of lines) {
+    const fence = line.match(/^```/);
+    if (fence) {
+      flushList();
+      if (inCode) { out.push('<pre><code>' + codeBuf.join('\n') + '</code></pre>'); inCode = false; codeBuf = []; }
+      else inCode = true;
+      continue;
+    }
+    if (inCode) { codeBuf.push(line); continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    if (h) { flushList(); const n = h[1].length; out.push('<h' + n + '>' + inlineMd(h[2]) + '</h' + n + '>'); continue; }
+    if (/^\s*[-*+]\s+/.test(line)) { if (listType !== 'ul') { flushList(); listType = 'ul'; } listBuf.push(line.replace(/^\s*[-*+]\s+/, '')); continue; }
+    if (/^\s*\d+[.)]\s+/.test(line)) { if (listType !== 'ol') { flushList(); listType = 'ol'; } listBuf.push(line.replace(/^\s*\d+[.)]\s+/, '')); continue; }
+    if (/^\s*>\s?/.test(line)) { flushList(); out.push('<blockquote>' + inlineMd(line.replace(/^\s*>\s?/, '')) + '</blockquote>'); continue; }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) { flushList(); out.push('<hr>'); continue; }
+    if (!line.trim()) { flushList(); continue; }
+    flushList();
+    out.push('<p>' + inlineMd(line) + '</p>');
+  }
+  if (inCode) out.push('<pre><code>' + codeBuf.join('\n') + '</code></pre>');
+  flushList();
+  return out.join('');
+}
+
+function renderOut() {
+  $('out').className = 'out';
+  $('out').innerHTML = state.raw ? mdToHtml(state.raw) : '（结果会显示在这里，流式输出并渲染 Markdown）';
+}
+
+async function api(path, options = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(state.token ? { 'x-bridge-token': state.token } : {}) };
+  const res = await fetch(path, { ...options, headers });
+  let body = null;
+  try { body = await res.json(); } catch { /* 非 JSON */ }
+  return { status: res.status, body };
+}
+
+function friendlyError(err) {
+  const map = {
+    E_AUTH: 'token 缺失/无效或已吊销 —— 重新创建并粘贴',
+    E_RATE_LIMIT: '超过频控，稍等 ' + Math.ceil((err.retryAfterMs || 60000) / 1000) + ' 秒再试',
+    E_BUSY: '队列已满，稍后重试',
+    E_TIMEOUT: '工具执行超时（进程已被终止），可重试',
+    E_TOOL_UNAVAILABLE: '工具未安装：' + (err.installHint || ''),
+    E_TOOL_DISABLED: '工具未启用：本机执行 cli-bridge tools allow <id>',
+  };
+  return '[' + err.code + '] ' + err.message + (map[err.code] ? '\n→ ' + map[err.code] : '');
+}
+
+async function connect() {
+  state.token = $('token').value.trim();
+  if (!state.token) return setStatus('请先粘贴 token', false);
+  const r = await api('/v1/tools');
+  if (r.status === 401) return setStatus('token 无效：执行 cli-bridge token create --origin local 重新签发', false);
+  if (!r.body || !r.body.ok) return setStatus('获取工具列表失败', false);
+  localStorage.setItem('bridge-token', state.token);
+  state.tools = r.body.data;
+  const sel = $('tool');
+  sel.innerHTML = '';
+  for (const t of state.tools.filter((x) => x.available)) {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = t.displayName + '（' + t.id + (t.untested ? ' · 声明未实测' : '') + '）';
+    sel.appendChild(opt);
+  }
+  if (!sel.children.length) {
+    return setStatus('白名单内没有可用工具：本机执行 cli-bridge tools allow agy', false);
+  }
+  $('authBox').hidden = true;
+  $('workBox').hidden = false;
+  updateModeBox();
+  setStatus('已连接：' + state.tools.filter((x) => x.available).length + ' 个工具可用', true);
+}
+
+function selectedTool() {
+  const id = $('tool').value;
+  return state.tools.find((t) => t.id === id);
+}
+
+function updateModeBox() {
+  const t = selectedTool();
+  const canImage = !!(t && t.capabilities && t.capabilities.image);
+  $('modeBox').hidden = !canImage;
+  if (!canImage) state.mode = 'text';
+  setMode(state.mode === 'image' && canImage ? 'image' : 'text');
+}
+
+function setMode(m) {
+  state.mode = m;
+  $('modeText').className = 'segBtn' + (m === 'text' ? ' active' : '');
+  $('modeImage').className = 'segBtn' + (m === 'image' ? ' active' : '');
+}
+
+// 走 OpenAI 兼容层：文本 → /v1/chat/completions（SSE 真流式）；图片 → /v1/images/generations。
+// 未声明流式的工具返回单块增量，页面逻辑完全一致。
+async function run() {
+  if (state.running) return;
+  return state.mode === 'image' ? runImage() : runText();
+}
+
+async function beginRun() {
+  const input = $('input').value.trim();
+  if (!input) { state.raw = ''; $('out').className = 'out err'; $('out').textContent = '输入不能为空'; return null; }
+  state.running = true;
+  state.raw = '';
+  state.ctrl = new AbortController();
+  $('runBtn').disabled = true;
+  $('cancelBtn').hidden = false;
+  if (state.mode === 'text') renderOut();
+  else { $('out').className = 'out'; $('out').textContent = '图片生成中…（可能需要 10 秒到几分钟）'; }
+  $('meta').textContent = '';
+  return input;
+}
+
+function endRun(started, { failMsg = null, usage = null } = {}) {
+  clearInterval(state.timer);
+  state.running = false;
+  state.ctrl = null;
+  $('runBtn').disabled = false;
+  $('cancelBtn').hidden = true;
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  if (failMsg !== null) {
+    $('out').className = 'out err';
+    $('out').textContent = failMsg || '（无输出）';
+    $('meta').textContent = secs + 's';
+  } else if (state.mode === 'text' && !state.raw) {
+    $('out').className = 'out err';
+    $('out').textContent = '（工具没有返回内容）';
+    $('meta').textContent = secs + 's';
+  } else if (state.mode === 'text') {
+    renderOut();
+    $('meta').textContent = secs + 's' + (usage && usage.total_tokens ? ' · ' + usage.total_tokens + ' tokens' : '');
+  } else {
+    $('meta').textContent = secs + 's';
+  }
+}
+
+async function runText() {
+  const input = await beginRun();
+  if (input === null) return;
+  const started = Date.now();
+  state.timer = setInterval(() => { $('meta').textContent = '已运行 ' + ((Date.now() - started) / 1000).toFixed(1) + 's'; }, 200);
+  let failMsg = null;
+  let usage = null;
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-bridge-token': state.token },
+      body: JSON.stringify({ model: $('tool').value, messages: [{ role: 'user', content: input }], stream: true, stream_options: { include_usage: true } }),
+      signal: state.ctrl.signal,
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => null);
+      failMsg = friendlyError((b && b.error) || { code: 'HTTP_' + res.status, message: '请求失败' });
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const evt = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const dataLine = evt.split('\n').find((l) => l.startsWith('data: '));
+          if (!dataLine) continue;
+          const data = dataLine.slice(6);
+          if (data === '[DONE]') continue;
+          let j;
+          try { j = JSON.parse(data); } catch { continue; }
+          if (j.error) { failMsg = friendlyError(j.error); continue; }
+          if (j.bridge_run_id) state.runId = j.bridge_run_id; // 桥扩展字段：用于"停止"时终止服务端工具进程
+          const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+          if (delta) { state.raw += delta; renderOut(); }
+          if (j.usage) usage = j.usage;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') failMsg = '已取消（服务端工具进程已同时终止）';
+    else failMsg = '请求失败：' + e.message;
+  }
+  endRun(started, { failMsg, usage });
+}
+
+async function runImage() {
+  const prompt = await beginRun();
+  if (prompt === null) return;
+  const started = Date.now();
+  state.timer = setInterval(() => { $('meta').textContent = '已生成 ' + ((Date.now() - started) / 1000).toFixed(1) + 's'; }, 200);
+  let failMsg = null;
+  let html = '';
+  let totalKB = 0;
+  try {
+    const res = await fetch('/v1/images/generations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-bridge-token': state.token },
+      body: JSON.stringify({ model: $('tool').value, prompt }),
+      signal: state.ctrl.signal,
+    });
+    const b = await res.json().catch(() => null);
+    if (!res.ok || !b || b.error || !Array.isArray(b.data)) {
+      failMsg = friendlyError((b && b.error) || { code: 'HTTP_' + res.status, message: '请求失败' });
+    } else {
+      const imgs = b.data.map((d) => '<img alt="生成的图片" src="data:' + sniffMime(d.b64_json) + ';base64,' + d.b64_json + '">').join('');
+      totalKB = b.data.reduce((s, d) => s + Math.round(d.b64_json.length * 0.75 / 1024), 0);
+      if (imgs) html = imgs;
+      else failMsg = '（端点返回成功但没有图片数据）';
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') failMsg = '已停止等待（本次工具调用仍会在后台完成并计入审计）';
+    else failMsg = '请求失败：' + e.message;
+  }
+  if (!failMsg) {
+    state.raw = html;
+    $('out').className = 'out';
+    $('out').innerHTML = html;
+  }
+  endRun(started, { failMsg });
+  if (!failMsg && totalKB) $('meta').textContent = ((Date.now() - started) / 1000).toFixed(1) + 's · ' + totalKB + 'KB';
+}
+
+async function init() {
+  $('token').value = state.token;
+  $('connectBtn').onclick = connect;
+  $('runBtn').onclick = run;
+  $('cancelBtn').onclick = async () => {
+    if (state.ctrl) state.ctrl.abort(); // 断开本页 SSE
+    if (state.runId) await api('/v1/runs/' + state.runId + '/cancel', { method: 'POST', body: '{}' }); // 同时终止服务端工具进程
+  };
+  $('modeText').onclick = () => setMode('text');
+  $('modeImage').onclick = () => setMode('image');
+  $('tool').addEventListener('change', updateModeBox);
+  $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run(); });
+  try {
+    const h = await api('/v1/health');
+    if (h.body && h.body.ok) {
+      $('version').textContent = 'v' + h.body.version;
+      if (state.token) { await connect(); }
+      else setStatus('桥运行中，粘贴 token 连接', true);
+    } else setStatus('桥响应异常', false);
+  } catch {
+    setStatus('桥未运行：本机终端执行 cli-bridge start', false);
+  }
+}
+init();
+</script>
+</body>
+</html>

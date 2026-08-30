@@ -1,0 +1,30 @@
+{
+  "name": "@sh0rk/cli-bridge",
+  "version": "0.1.0",
+  "description": "本机 CLI AI 工具的统一受控桥：网页 / 本地程序 / AI Agent 以一份稳定协议调用 agy、codex 等命令行工具",
+  "type": "module",
+  "bin": {
+    "cli-bridge": "bin/cli-bridge.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "public/",
+    "skills/",
+    "docs/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/cli-bridge.js start",
+    "test": "node --test",
+    "test:agy": "CLI_BRIDGE_AGY_E2E=1 node --test test/e2e-agy.test.js",
+    "test:agy:image": "CLI_BRIDGE_AGY_E2E=1 CLI_BRIDGE_IMAGE_E2E=1 node --test test/e2e-agy.test.js"
+  },
+  "license": "MIT"
+}

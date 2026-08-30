@@ -1,0 +1,430 @@
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import { BridgeError } from '../errors.js';
+import { getPath } from '../util.js';
+import { workspaceRoot } from './config.js';
+
+export function makeRunDir(toolId, runId) {
+  const dir = path.join(workspaceRoot(), toolId, runId);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** 杀整个进程组：先 SIGTERM，5 秒后兜底 SIGKILL。 */
+export function killProcessTree(child) {
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const pid = child.pid;
+  const signal = (sig) => {
+    try {
+      process.kill(-pid, sig); // detached 模式下 -pid 命中整个进程组
+    } catch {
+      try {
+        child.kill(sig);
+      } catch {
+        /* 进程已退出 */
+      }
+    }
+  };
+  signal('SIGTERM');
+  const t = setTimeout(() => signal('SIGKILL'), 5000);
+  if (typeof t.unref === 'function') t.unref();
+  child.once('close', () => clearTimeout(t));
+}
+
+/** 选项白名单 → argv（引擎已做过类型/白名单校验，这里只做映射）。 */
+function optionsToArgs(decl, options) {
+  const args = [];
+  for (const opt of decl.options) {
+    const v = options?.[opt.name];
+    if (v === undefined) continue;
+    args.push(opt.flag);
+    if (opt.type !== 'boolean') args.push(String(v));
+  }
+  return args;
+}
+
+function unavailableError(decl) {
+  return new BridgeError('E_TOOL_UNAVAILABLE', `工具 ${decl.binary} 未安装或不可执行`, {
+    installHint: decl.installHint || '',
+  });
+}
+
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 按适配器声明从 stdout 提取输出；失败抛 BridgeError。 */
+function extractOutput(decl, stdoutBuf, { exitCode, truncated }) {
+  const text = stdoutBuf.toString('utf8');
+  const preview = text.trim().slice(0, 300);
+  const fail = (msg) => {
+    throw new BridgeError('E_TOOL_FAILED', truncated ? `${msg}（输出已被截断）` : msg);
+  };
+  if (exitCode !== 0) {
+    fail(`工具退出码 ${exitCode}（非成功）${preview ? `，输出预览：${preview}` : ''}`);
+  }
+
+  if (decl.run.output === 'text') {
+    return { value: text.trim(), usage: undefined };
+  }
+
+  if (decl.run.output === 'json') {
+    let obj = tryParseJson(text);
+    if (obj === undefined || obj === null) {
+      // 容忍工具在 JSON 前后混入非 JSON 日志：截取首尾大括号之间重试（原型验证过的行为）
+      obj = tryParseJson(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+    }
+    if (obj === undefined || obj === null) fail(`工具输出不是合法 JSON${preview ? `：${preview}` : ''}`);
+    if (decl.run.jsonStatusPath) {
+      const st = getPath(obj, decl.run.jsonStatusPath);
+      const okList = decl.run.jsonStatusSuccess;
+      if (okList && !okList.includes(st)) {
+        const detail = typeof obj?.response === 'string' ? `：${obj.response.slice(0, 200)}` : '';
+        fail(`工具返回状态 ${String(st)}${detail}`);
+      }
+    }
+    const value = getPath(obj, decl.run.jsonResponsePath);
+    if (value === undefined) fail(`无法从输出提取 ${decl.run.jsonResponsePath}${preview ? `，预览：${preview}` : ''}`);
+    return { value, usage: decl.run.usagePath ? getPath(obj, decl.run.usagePath) : undefined };
+  }
+
+  // ndjson：取最后一条匹配 ndjsonPick（点路径 → 期望值）的行
+  const pick = decl.run.ndjsonPick || {};
+  let picked;
+  for (const line of text.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    let obj;
+    try {
+      obj = JSON.parse(s);
+    } catch {
+      continue;
+    }
+    if (Object.entries(pick).every(([k, v]) => getPath(obj, k) === v)) picked = obj;
+  }
+  if (!picked) fail(`输出中未找到匹配的事件${preview ? `，预览：${preview}` : ''}`);
+  const value = getPath(picked, decl.run.ndjsonTextPath);
+  if (value === undefined) fail(`无法从事件提取 ${decl.run.ndjsonTextPath}`);
+  return { value, usage: decl.run.usagePath ? getPath(picked, decl.run.usagePath) : undefined };
+}
+
+/**
+ * 执行一次适配器调用。
+ * resolve({ output, meta })；失败 reject(BridgeError)：
+ *   E_TOOL_UNAVAILABLE（二进制缺失）/ E_TIMEOUT / E_CANCELLED / E_TOOL_FAILED（附 stderrTail）。
+ * 每次运行在 ~/.cli-bridge/workspace/<tool>/<runId>/ 下执行，隔离工具落盘行为。
+ */
+export function execAdapter({ decl, input, options, timeoutMs, runId, isCancelled = () => false, onSpawn }) {
+  return new Promise((resolve, reject) => {
+    const args = decl.run.args.map((a) => (a === '{input}' ? input : a)).concat(optionsToArgs(decl, options));
+    const startedAt = Date.now();
+    const cwd = makeRunDir(decl.id, runId);
+
+    let child;
+    try {
+      child = spawn(decl.binary, args, {
+        cwd,
+        detached: true, // 独立进程组，超时/取消可整组终止
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      return reject(unavailableError(decl));
+    }
+    onSpawn?.(child);
+
+    const stdoutCap = decl.limits.outputMaxBytes;
+    let stdout = Buffer.alloc(0);
+    let truncated = false;
+    let stderr = Buffer.alloc(0);
+    const STDERR_CAP = 64 * 1024;
+
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length >= stdoutCap) {
+        truncated = true;
+        return;
+      }
+      const room = stdoutCap - stdout.length;
+      stdout = Buffer.concat([stdout, chunk.subarray(0, room)]);
+      if (chunk.length > room) truncated = true;
+    });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < STDERR_CAP) stderr = Buffer.concat([stderr, chunk.subarray(0, STDERR_CAP - stderr.length)]);
+    });
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child);
+    }, timeoutMs);
+
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      if (e.code === 'ENOENT') return reject(unavailableError(decl));
+      reject(new BridgeError('E_TOOL_FAILED', `工具进程启动失败：${e.message}`));
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const durationMs = Date.now() - startedAt;
+      const stderrTail = stderr.toString('utf8').trim().slice(-500);
+      if (isCancelled()) {
+        return reject(new BridgeError('E_CANCELLED', '运行已被取消', { durationMs }));
+      }
+      if (timedOut) {
+        return reject(
+          new BridgeError('E_TIMEOUT', `工具执行超过 ${timeoutMs}ms，已终止进程组`, { durationMs, stderrTail: stderrTail || undefined })
+        );
+      }
+      try {
+        const { value, usage } = extractOutput(decl, stdout, { exitCode: code, truncated });
+        const meta = { durationMs, exitCode: code, ...(usage !== undefined ? { usage } : {}), ...(truncated ? { truncated } : {}) };
+        resolve({ output: value, meta });
+      } catch (e) {
+        if (e instanceof BridgeError) {
+          e.extra = { ...(e.extra || {}), durationMs, exitCode: code, ...(stderrTail ? { stderrTail } : {}) };
+          reject(e);
+        } else {
+          reject(new BridgeError('E_TOOL_FAILED', e?.message || '输出解析失败', { durationMs, exitCode: code }));
+        }
+      }
+    });
+  });
+}
+
+function matchWhen(obj, when) {
+  if (!when) return true;
+  return Object.entries(when).every(([k, v]) => getPath(obj, k) === v);
+}
+
+/**
+ * 流式/实时执行（流式聊天与图片生成共用）：
+ * - stdout 逐行解析 NDJSON 事件；命中 decl.stream.deltas 时调 onDelta(text)（真增量流式）；
+ * - 命中 decl.stream.final 时暂存最终结果（output/status/usage），进程收尾时结算；
+ * - 图片模式（image = {extensions, fileStableMs, toolName}）：轮询工作目录，图片文件出现且
+ *   尺寸稳定即终止进程组并收割（实测 agy 出图后可能挂住不退出）；声明的图片工具调用报错
+ *   且尚未出图时快速失败（实测 agent 会转入无效的 shell 兜底，空耗数分钟）。
+ * 无 decl.stream 的适配器退化为缓冲执行，收尾走 extractOutput。
+ */
+export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelta, image = null, isCancelled = () => false, onSpawn }) {
+  return new Promise((resolve, reject) => {
+    const useStream = !!decl.stream;
+    let args = (useStream ? decl.stream.args : decl.run.args).map((a) => (a === '{input}' ? input : a));
+    if (image && Array.isArray(decl.image?.extraArgs)) args = args.concat(decl.image.extraArgs);
+    args = args.concat(optionsToArgs(decl, options));
+
+    const startedAt = Date.now();
+    const cwd = makeRunDir(decl.id, runId);
+    let child;
+    try {
+      child = spawn(decl.binary, args, {
+        cwd,
+        detached: true,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      return reject(unavailableError(decl));
+    }
+    onSpawn?.(child);
+
+    const stdoutCap = decl.limits.outputMaxBytes;
+    let stdoutBuf = Buffer.alloc(0);
+    let truncated = false;
+    let stderr = Buffer.alloc(0);
+    const STDERR_CAP = 64 * 1024;
+
+    let timedOut = false;
+    let settled = false;
+    let fileTimer = null;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (fileTimer) clearInterval(fileTimer);
+      fn(arg);
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child);
+    }, timeoutMs);
+
+    // —— NDJSON 事件流解析 ——
+    const decoder = new StringDecoder('utf8');
+    let lineBuf = '';
+    let final = null; // { output, usage, status }
+    let fileSeen = false;
+    const handleLine = (line) => {
+      const s = line.trim();
+      if (!s || (!useStream && !image)) return; // 图片模式也需解析事件（快速失败依赖工具错误事件）
+      let ev;
+      try {
+        ev = JSON.parse(s);
+      } catch {
+        return;
+      }
+      const st = decl.stream;
+      if (st && onDelta && st.deltas && matchWhen(ev, st.deltas.when)) {
+        const text = getPath(ev, st.deltas.path);
+        if (typeof text === 'string' && text) {
+          if (stdoutBuf.length < stdoutCap) onDelta(text);
+          else truncated = true;
+        }
+      }
+      if (st && st.final && matchWhen(ev, st.final.when)) {
+        final = {
+          output: getPath(ev, st.final.outputPath),
+          usage: st.final.usagePath ? getPath(ev, st.final.usagePath) : undefined,
+          status: st.final.statusPath ? getPath(ev, st.final.statusPath) : undefined,
+        };
+      }
+      if (image && image.toolName && !fileSeen) {
+        const su = ev && ev.step_update;
+        if (su && su.state === 'ERROR' && su.tool_name === image.toolName) {
+          killProcessTree(child);
+          finish(reject, new BridgeError('E_TOOL_FAILED', `图片生成工具 ${image.toolName} 调用失败（已中止，避免无效重试；可稍后重试）`, {
+            durationMs: Date.now() - startedAt,
+            detail: JSON.stringify(su).slice(0, 300),
+          }));
+        }
+      }
+    };
+    child.stdout.on('data', (chunk) => {
+      if (stdoutBuf.length < stdoutCap) {
+        const room = stdoutCap - stdoutBuf.length;
+        stdoutBuf = Buffer.concat([stdoutBuf, chunk.subarray(0, room)]);
+        if (chunk.length > room) truncated = true;
+      } else truncated = true;
+      lineBuf += decoder.write(chunk);
+      let idx;
+      while ((idx = lineBuf.indexOf('\n')) !== -1) {
+        handleLine(lineBuf.slice(0, idx));
+        lineBuf = lineBuf.slice(idx + 1);
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < STDERR_CAP) stderr = Buffer.concat([stderr, chunk.subarray(0, STDERR_CAP - stderr.length)]);
+    });
+
+    // —— 图片文件收割 ——
+    if (image) {
+      const exts = image.extensions.map((e) => e.toLowerCase());
+      let stableName = null;
+      let stableSize = -1;
+      let stableSince = 0;
+      fileTimer = setInterval(() => {
+        if (settled) return;
+        let hit = null;
+        try {
+          for (const name of fs.readdirSync(cwd)) {
+            if (name.startsWith('.')) continue;
+            if (!exts.includes(path.extname(name).toLowerCase())) continue;
+            const st = fs.statSync(path.join(cwd, name));
+            if (st.isFile() && st.size > 0) {
+              hit = { name, size: st.size };
+              break;
+            }
+          }
+        } catch {
+          /* 目录尚未就绪 */
+        }
+        if (!hit) {
+          stableName = null;
+          return;
+        }
+        fileSeen = true;
+        if (hit.name === stableName && hit.size === stableSize && Date.now() - stableSince >= (image.fileStableMs ?? 1500)) {
+          setTimeout(() => {
+            if (settled) return;
+            let files = [];
+            try {
+              files = fs
+                .readdirSync(cwd)
+                .filter((n) => !n.startsWith('.') && exts.includes(path.extname(n).toLowerCase()))
+                .filter((n) => fs.statSync(path.join(cwd, n)).size > 0);
+            } catch {
+              /* 忽略 */
+            }
+            if (!files.length) return; // 文件可能被改名，继续等
+            finish(resolve, { output: files, meta: { durationMs: Date.now() - startedAt } });
+            killProcessTree(child);
+          }, 400);
+        } else if (hit.name !== stableName || hit.size !== stableSize) {
+          stableName = hit.name;
+          stableSize = hit.size;
+          stableSince = Date.now();
+        }
+      }, 400);
+      if (typeof fileTimer.unref === 'function') fileTimer.unref();
+    }
+
+    child.on('error', (e) => {
+      if (e.code === 'ENOENT') return finish(reject, unavailableError(decl));
+      finish(reject, new BridgeError('E_TOOL_FAILED', `工具进程启动失败：${e.message}`));
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      lineBuf += decoder.end();
+      if (lineBuf.trim()) handleLine(lineBuf);
+      const durationMs = Date.now() - startedAt;
+      const stderrTail = stderr.toString('utf8').trim().slice(-500);
+      const preview = stdoutBuf.toString('utf8').trim().slice(0, 300);
+
+      if (isCancelled()) return finish(reject, new BridgeError('E_CANCELLED', '运行已被取消', { durationMs }));
+      if (timedOut) {
+        return finish(reject, new BridgeError('E_TIMEOUT', `工具执行超过 ${timeoutMs}ms，已终止进程组`, { durationMs, stderrTail: stderrTail || undefined }));
+      }
+
+      if (image) {
+        const agentSays = final && typeof final.output === 'string' && final.output.trim() ? `。工具回复：${final.output.trim().slice(0, 200)}` : '';
+        return finish(
+          reject,
+          new BridgeError('E_TOOL_FAILED', `工具已结束但未产出图片文件${agentSays}${preview && !agentSays ? `，输出预览：${preview}` : ''}`, {
+            durationMs,
+            exitCode: code,
+            ...(stderrTail ? { stderrTail } : {}),
+          })
+        );
+      }
+
+      if (!useStream) {
+        try {
+          const { value, usage } = extractOutput(decl, stdoutBuf, { exitCode: code, truncated });
+          return finish(resolve, {
+            output: value,
+            meta: { durationMs, exitCode: code, ...(usage !== undefined ? { usage } : {}), ...(truncated ? { truncated } : {}) },
+          });
+        } catch (e) {
+          if (e instanceof BridgeError) {
+            e.extra = { ...(e.extra || {}), durationMs, exitCode: code, ...(stderrTail ? { stderrTail } : {}) };
+            return finish(reject, e);
+          }
+          return finish(reject, new BridgeError('E_TOOL_FAILED', e?.message || '输出解析失败', { durationMs, exitCode: code }));
+        }
+      }
+
+      if (!final) {
+        return finish(reject, new BridgeError('E_TOOL_FAILED', '工具输出缺少最终结果事件', { durationMs, exitCode: code, ...(stderrTail ? { stderrTail } : {}) }));
+      }
+      const okList = decl.stream.final.successValues;
+      if (decl.stream.final.statusPath && okList && !okList.includes(final.status)) {
+        const detail = typeof final.output === 'string' ? `：${final.output.slice(0, 200)}` : '';
+        return finish(reject, new BridgeError('E_TOOL_FAILED', `工具返回状态 ${String(final.status)}${detail}`, { durationMs, exitCode: code }));
+      }
+      if (final.output === undefined) {
+        return finish(reject, new BridgeError('E_TOOL_FAILED', `无法从最终事件提取 ${decl.stream.final.outputPath}`, { durationMs, exitCode: code }));
+      }
+      finish(resolve, {
+        output: final.output,
+        meta: { durationMs, exitCode: code, ...(final.usage !== undefined ? { usage: final.usage } : {}) },
+      });
+    });
+  });
+}

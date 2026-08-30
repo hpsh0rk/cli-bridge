@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+*.log
+*.tgz
+# 内部交接文档：含个人路径与会话信息，只留本地，不进远端
+HANDOFF.md
