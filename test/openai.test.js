@@ -22,7 +22,8 @@ setTimeout(() => {
 `;
 
 const FAILFAST_CODE = `
-setTimeout(() => console.log(JSON.stringify({ event: 'step_update', step_update: { state: 'ERROR', tool_name: 'generate_image', tool_info: { error: 'quota exceeded' } } })), 60);
+const evt = { event: 'step_update', step_update: { state: 'ERROR', tool_name: 'generate_image', duration_seconds: 0.4, tool_info: { name: 'generate_image', error: { type: 'TOOL_ERROR', message: 'failed to generate content: 429 Too Many Requests, body: ' + JSON.stringify({ error: { code: 429, message: 'You have exhausted your capacity on this model. Your quota will reset after 23h26m2s.', status: 'RESOURCE_EXHAUSTED', details: [ { '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'QUOTA_EXHAUSTED', metadata: { model: 'gemini-3.1-flash-image', quotaResetTimeStamp: '2026-08-31T14:50:39Z' } } ] } }) } } } };
+setTimeout(() => console.log(JSON.stringify(evt)), 60);
 setInterval(() => {}, 1000); // 不退出：验证桥快速失败而不是干等超时
 `;
 
@@ -173,6 +174,11 @@ test('images/generations：n>1 / 非图片工具 被拒绝；generate_image 失�
   assert.equal(r.status, 502);
   assert.equal(r.json.error.code, 'E_TOOL_FAILED');
   assert.ok(/generate_image/.test(r.json.error.message));
+  // 真实原因透传（429 配额耗尽 → 人话摘要 + 原始详情）
+  assert.ok(/配额已用尽/.test(r.json.error.message), r.json.error.message);
+  assert.ok(/gemini-3\.1-flash-image/.test(r.json.error.message));
+  assert.ok(/2026-08-31T14:50:39Z/.test(r.json.error.message));
+  assert.ok(/QUOTA_EXHAUSTED/.test(r.json.error.detail));
   assert.ok(Date.now() - started < 5000, '应在工具报错后快速失败，而不是等超时');
 });
 

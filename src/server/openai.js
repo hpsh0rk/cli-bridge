@@ -33,7 +33,10 @@ const ERROR_TYPES = {
 
 export function openaiErrorPayload(be) {
   const [type, status] = ERROR_TYPES[be.code] || ['api_error', 500];
-  return { status, body: { error: { message: be.message, type, param: null, code: be.code } } };
+  return {
+    status,
+    body: { error: { message: be.message, type, param: null, code: be.code, ...(be.extra || {}) } },
+  };
 }
 
 function sendOpenAiError(res, be) {

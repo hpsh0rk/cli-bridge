@@ -204,6 +204,41 @@ function matchWhen(obj, when) {
 }
 
 /**
+ * 从图片工具的 ERROR 事件提取人话原因（实测 agy generate_image 失败时
+ * tool_info.error.message 内嵌 Google API 的 JSON body：429 QUOTA_EXHAUSTED 等）。
+ */
+function describeImageToolError(su) {
+  const raw = su && su.tool_info && su.tool_info.error;
+  if (!raw) return null;
+  const rawMsg = typeof raw.message === 'string' ? raw.message : JSON.stringify(raw);
+  const parsed = { status: (rawMsg.match(/\b(\d{3})\s/) || [])[1], apiMsg: '', reason: '', model: '', reset: '' };
+  const bodyIdx = rawMsg.indexOf('body:');
+  if (bodyIdx !== -1) {
+    try {
+      const j = JSON.parse(rawMsg.slice(bodyIdx + 5).trim());
+      parsed.apiMsg = (j.error && j.error.message) || '';
+      const info = ((j.error && j.error.details) || []).find((d) => String(d['@type'] || '').includes('ErrorInfo')) || {};
+      parsed.reason = info.reason || '';
+      parsed.model = (info.metadata && info.metadata.model) || '';
+      parsed.reset = (info.metadata && info.metadata.quotaResetTimeStamp) || '';
+    } catch {
+      /* 内嵌体不是 JSON 就按原文兜底 */
+    }
+  }
+  let human;
+  if (/QUOTA_EXHAUSTED|quota/i.test(rawMsg)) {
+    human = `图像生成配额已用尽${parsed.model ? `（模型 ${parsed.model}）` : ''}` +
+      (parsed.reset ? `，将于 ${parsed.reset} 重置` : '') +
+      '。这是上游配额限制，不是桥的故障；恢复后重试即可。';
+  } else if (parsed.status === '401' || parsed.status === '403') {
+    human = `图像生成认证/权限被拒（HTTP ${parsed.status}），请检查工具的登录态。`;
+  } else {
+    human = `图像生成工具报错${parsed.status ? `（HTTP ${parsed.status}）` : ''}：${(parsed.apiMsg || rawMsg).slice(0, 200)}`;
+  }
+  return { human, raw: rawMsg.slice(0, 500) };
+}
+
+/**
  * 流式/实时执行（流式聊天与图片生成共用）：
  * - stdout 逐行解析 NDJSON 事件；命中 decl.stream.deltas 时调 onDelta(text)（真增量流式）；
  * - 命中 decl.stream.final 时暂存最终结果（output/status/usage），进程收尾时结算；
@@ -288,10 +323,12 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
         const su = ev && ev.step_update;
         if (su && su.state === 'ERROR' && su.tool_name === image.toolName) {
           killProcessTree(child);
-          finish(reject, new BridgeError('E_TOOL_FAILED', `图片生成工具 ${image.toolName} 调用失败（已中止，避免无效重试；可稍后重试）`, {
-            durationMs: Date.now() - startedAt,
-            detail: JSON.stringify(su).slice(0, 300),
-          }));
+          const described = describeImageToolError(su);
+          finish(reject, new BridgeError(
+            'E_TOOL_FAILED',
+            `图片生成工具 ${image.toolName} 调用失败（已中止，避免无效重试）${described ? '：' + described.human : ''}`,
+            { durationMs: Date.now() - startedAt, ...(described ? { detail: described.raw } : {}) }
+          ));
         }
       }
     };

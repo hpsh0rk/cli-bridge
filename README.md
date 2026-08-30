@@ -182,9 +182,30 @@ open("out.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 - **端口被占用**：`cli-bridge start --port <N>` 换端口；默认 39487 只绑 127.0.0.1。
 - **提示工具未启用（E_TOOL_DISABLED）**：这是白名单默认全关的设计，`cli-bridge tools allow <id>` 显式启用。
 - **提示工具未安装（E_TOOL_UNAVAILABLE）**：按返回的 `installHint` 安装（如 `npm i -g @openai/codex`），装好无需重启桥即可被探测到。
+- **图片生成报"配额已用尽"**：图片能力来自上游模型（agy 走 Google 的图像模型），有每日配额。桥会把上游的真实原因透传出来，例如：
+  ```
+  [E_TOOL_FAILED] 图片生成工具 generate_image 调用失败（已中止，避免无效重试）：
+  图像生成配额已用尽（模型 gemini-3.1-flash-image），将于 2026-08-31T14:50:39Z 重置。
+  ```
+  按提示的时间等配额重置后重试即可，无需任何操作。失败时桥会快速中止（不空耗超时），`error.detail` 保留上游原始错误。
 - **测试会不会动我的 agy 授权？** 不会。`npm test` 默认零外部调用；真实 agy 端到端需要 `npm run test:agy` 显式开启。
 - **Windows 可用吗？** 代码已含命名管道（`\\.\pipe\cli-bridge`）分支，但未在 Windows 上实测，欢迎反馈。
 - **桥开机自启**：用系统守护机制托管 `cli-bridge start`（如 macOS launchd / systemd），桥自身不内置守护。
+
+## 给维护者：发布流程
+
+```bash
+# 1. 改 package.json 的 version（semver：修复→patch，新功能→minor）
+# 2. 回归
+npm test                          # 快速套件（默认不含真实 agy 调用）
+CLI_BRIDGE_AGY_E2E=1 npm run test:agy   # 有 agy 环境时跑真实端到端
+# 3. 打包自查
+npm pack --dry-run                # 核对包内容（files 字段控制范围）
+# 4. 发布（scoped 包已配置 publishConfig.access=public）
+npm publish
+# 5. 打 tag 推送
+git tag v0.1.x && git push origin v0.1.x
+```
 
 ## 测试
 
