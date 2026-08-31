@@ -68,6 +68,18 @@ open http://127.0.0.1:39487/
 
 同源请求豁免 https 来源白名单（token 仍必填）；部署在外部 https 站点的页面走完整接入流程，见下节与 [docs/PROTOCOL.md §5](docs/PROTOCOL.md)。
 
+## 在线调试台
+
+不想在终端里逐步配对？打开 **[sh0rk.cn/tools/cli-bridge](https://sh0rk.cn/tools/cli-bridge)** ——本桥的网页版调试台：
+
+- **一键复制安装命令**，照着引导装好并启动桥；
+- **检测桥状态**（`GET /v1/health`），未装 / 未启动 / 被浏览器本地网络权限拦截都有对应提示；
+- **配对向导**按你当前访问的页面 origin 动态生成 `origins add` 与 `token create` 命令，token 验证后只存本浏览器；
+- **调试控制台**拉取工具白名单，同步 / 异步（SSE 事件流）两种模式运行，支持取消；
+- 页面底部有**原始请求日志**，每个请求的 URL、状态码、耗时与响应体都可展开复制。
+
+适合快速测试、排查接入问题，也可以当第三方网页接入的实现参考（页面源码在 [personal-site](https://github.com/hpsh0rk/personal-site) 的 `apps/web/src/pages/tools/cli-bridge.astro`）。
+
 ## 网页接入（30 秒版）
 
 ```js

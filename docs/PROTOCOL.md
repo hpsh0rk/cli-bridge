@@ -59,7 +59,7 @@ curl --unix-socket ~/.cli-bridge/bridge.sock http://localhost/v1/tools
 - **无 Origin 的本机 HTTP 客户端**（curl、脚本、Agent）只能使用 `cli-bridge token create --origin local` 签发的 token。走 UDS 则完全免 token（推荐）。
 - **桥自带演示页（`GET /`）**：桥自身同源请求（Origin 为 `http://127.0.0.1:PORT` / `http://localhost:PORT`）豁免来源白名单（同源本不受 CORS 约束），token 仍必填且按 local 规则校验。其他任何 http 来源不享受豁免。
 - token 由用户在本机终端签发并粘贴进网页（v1 配对流程）；服务端只存 SHA-256 哈希，可随时 `token revoke`。
-- `GET /v1/health` 无需鉴权。
+- `GET /v1/health` 无需鉴权，且响应恒带 `Access-Control-Allow-Origin: *`——首次探测发生在 `origins add` 之前，若按白名单给 CORS，非白名单页面会读不到响应（fetch 抛 `TypeError`），检测永远失败。
 
 ## 4. 端点
 
@@ -158,7 +158,7 @@ data: {"type":"running","ts":1756500000000}
 > **零配置的浏览器验证**：直接打开桥自带的控制台 `http://127.0.0.1:39487/`——同源请求，无跨域与 LNA 问题，粘贴 local token 即可运行/取消。下文流程针对**部署在外部 https 站点**的页面。
 
 ```
-探测 GET /v1/health ──失败──▶ 引导页：展示 "npx cli-bridge@1 start" 复制命令
+探测 GET /v1/health ──失败──▶ 引导页：展示 "npx @sh0rk/cli-bridge start" 复制命令
       │成功                     （用户在终端启动后回到页面重试）
       ▼
 「连接」按钮（必须在用户点击手势里发起首次真实请求；Chrome 142+ 会弹
@@ -187,7 +187,7 @@ const token = localStorage.getItem('bridge-token');
 
 async function connect() {
   const health = await fetch(`${BASE}/v1/health`).then(r => r.json()).catch(() => null);
-  if (!health?.ok) throw new Error('桥未运行，请在终端执行 npx cli-bridge@1 start');
+  if (!health?.ok) throw new Error('桥未运行，请在终端执行 npx @sh0rk/cli-bridge start');
   const tools = await fetch(`${BASE}/v1/tools`, { headers: { 'x-bridge-token': token } });
   if (tools.status === 401) throw new Error('需要配对 token');
   return tools.json();

@@ -114,7 +114,7 @@
 ### 3.3 网页接入标准流程（写入接入文档，所有站点照抄）
 
 ```
-探测 /v1/health ──失败──▶ 引导页：展示 "npx cli-bridge start" 复制命令 / 二进制下载
+探测 /v1/health ──失败──▶ 引导页：展示 "npx @sh0rk/cli-bridge start" 复制命令 / 二进制下载
       │成功                          （用户在终端启动后回到页面）
       ▼
 用户点击「连接」◀── 必须在用户手势里发起首次真实请求（Chrome 142+ LNA 权限弹窗）
@@ -229,7 +229,7 @@ cli-bridge run <tool> <input>   # 本机快捷调用（走 UDS，等价 HTTP POS
 | 配置被篡改 | 恶意 repo / npm postinstall 写配置 | §5.1 不变量：只读 `~/.cli-bridge/`；写操作走交互 CLI |
 | token 泄露 | localStorage 被 XSS 读走 | per-origin 绑定（token 只对签发时的 Origin 有效）；服务端存哈希；可随时 `token revoke` |
 | 工具输出炸弹 | prompt 诱导工具输出超大内容 | outputMaxBytes 截断 + `truncated` 标记 |
-| 供应链 | npx 拉到恶意版本 | 发布 npm provenance；文档建议锁版本 `npx cli-bridge@1.x`；二进制提供 checksum |
+| 供应链 | npx 拉到恶意版本 | 发布 npm provenance；文档建议锁版本 `npx @sh0rk/cli-bridge@0.1.x`；二进制提供 checksum |
 
 ### 6.2 token 模型
 
@@ -272,7 +272,7 @@ cli-bridge run <tool> <input>   # 本机快捷调用（走 UDS，等价 HTTP POS
 
 | 出口 | 形态 | 用户动作 | 适用 |
 |---|---|---|---|
-| **npx** | `npx cli-bridge@1 start` | 复制一条命令 | 网站引导页首选；临时使用 |
+| **npx** | `npx @sh0rk/cli-bridge start` | 复制一条命令 | 网站引导页首选；临时使用 |
 | **CLI** | 全局安装 `npm i -g cli-bridge` / 平台二进制（Bun compile，GitHub Releases + checksum） | 装一次常驻/开机自启 | 重度用户 |
 | **Skill** | `skills/cli-bridge/SKILL.md` | 交给 AI Agent 安装使用 | ZCode/Claude 等 Agent 场景 |
 
