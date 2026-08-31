@@ -35,6 +35,11 @@ test('health：无需鉴权、任意来源可探测，且不泄露工具列表',
   assert.equal(r.json.ok, true);
   assert.equal(r.json.tokenRequired, true);
   assert.ok(!/fake|agy|codex/i.test(r.text), 'health 不得泄露工具信息');
+  // CORS 恒为 *：网页的首次探测发生在 origins add 之前，
+  // 非白名单来源若拿不到 ACAO，浏览器会拒读响应（fetch 抛 TypeError）。
+  const foreign = await get(port, '/v1/health', { Origin: 'https://not-allowed-yet.com' });
+  assert.equal(foreign.status, 200);
+  assert.equal(foreign.headers['access-control-allow-origin'], '*');
 });
 
 test('防 DNS rebinding：非法 Host 一律 403', async (t) => {

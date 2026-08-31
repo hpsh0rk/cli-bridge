@@ -144,9 +144,11 @@ export function createRequestHandler({ config, engine, version, verbose = false 
         return res.end(html);
       }
 
-      // health 对任意来源开放（只暴露版本与 token 策略，不泄露工具列表）
+      // health 对任意来源开放（只暴露版本与 token 策略，不泄露工具列表）。
+      // CORS 恒为 *：探测必须发生在 origins add 之前，按白名单给 CORS 会让
+      // 首次探测在浏览器侧读不到响应（fetch 抛 TypeError），检测永远失败。
       if (req.method === 'GET' && url.pathname === '/v1/health') {
-        return sendJson(res, 200, { ok: true, version, tokenRequired: config.auth.requireToken }, cors);
+        return sendJson(res, 200, { ok: true, version, tokenRequired: config.auth.requireToken }, { 'Access-Control-Allow-Origin': '*' });
       }
 
       let tokenRecord = null;
