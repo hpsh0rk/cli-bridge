@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { BridgeError } from '../errors.js';
@@ -278,6 +279,7 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
     let timedOut = false;
     let settled = false;
     let fileTimer = null;
+    let finalHarvest = null; // 图片模式：进程退出后的兜底收割（close 处理器调用）
     const finish = (fn, arg) => {
       if (settled) return;
       settled = true;
@@ -350,55 +352,107 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
     });
 
     // —— 图片文件收割 ——
+    // cwd（工具约定落盘处）之外，还扫 image.searchDirs（适配器声明的额外语境目录，支持 ~）：
+    // 实测新版 agy 的 generate_image 把产物写进 brain 会话目录（<searchDir>/<会话 id>/图片）而非 cwd，
+    // 因此 searchDir 根与其直接子目录都在扫描范围。mtime 晚于 run 开始才认，防止收割旧会话/并发会话的历史产物。
+    // 外部目录的命中文件复制进 cwd（run 工作目录）再返回，下游（/v1/files、b64 读取）保持只看 cwd。
     if (image) {
       const exts = image.extensions.map((e) => e.toLowerCase());
-      let stableName = null;
-      let stableSize = -1;
+      // mtime 防线必须严格：文件只可能在 spawn 之后写出，而 startedAt 在 spawn 前捕获，
+      // 因此 mtime >= startedAt（无余量）恰好排除上一次运行/历史会话落下的旧图——
+      // 留任何余量都会让"背靠背两次生成"误收前一次的图。
+      const freshSince = startedAt;
+      const searchDirs = (Array.isArray(image.searchDirs) ? image.searchDirs : []).map((d) =>
+        d.startsWith('~') ? path.join(os.homedir(), d.slice(1)) : d
+      );
+      const scanImageFiles = () => {
+        const dirs = [cwd];
+        for (const root of searchDirs) {
+          dirs.push(root);
+          try {
+            for (const sub of fs.readdirSync(root)) {
+              try {
+                if (fs.statSync(path.join(root, sub)).isDirectory()) dirs.push(path.join(root, sub));
+              } catch {
+                /* 竞态删除 */
+              }
+            }
+          } catch {
+            /* 目录尚未就绪 */
+          }
+        }
+        const hits = [];
+        for (const dir of dirs) {
+          let names = [];
+          try {
+            names = fs.readdirSync(dir);
+          } catch {
+            continue;
+          }
+          for (const name of names) {
+            if (name.startsWith('.') || !exts.includes(path.extname(name).toLowerCase())) continue;
+            try {
+              const st = fs.statSync(path.join(dir, name));
+              if (st.isFile() && st.size > 0 && st.mtimeMs >= freshSince) hits.push({ dir, name, size: st.size });
+            } catch {
+              /* 竞态删除 */
+            }
+          }
+        }
+        return hits;
+      };
+      // 外部文件落回 run 工作目录；返回 cwd 内最终图片文件名列表
+      const collectIntoCwd = (hits) => {
+        for (const h of hits) {
+          if (h.dir !== cwd) {
+            try {
+              fs.copyFileSync(path.join(h.dir, h.name), path.join(cwd, h.name));
+            } catch {
+              /* 复制失败当作没看见 */
+            }
+          }
+        }
+        try {
+          return fs
+            .readdirSync(cwd)
+            .filter((n) => !n.startsWith('.') && exts.includes(path.extname(n).toLowerCase()))
+            .filter((n) => fs.statSync(path.join(cwd, n)).size > 0);
+        } catch {
+          return [];
+        }
+      };
+
+      let stableKey = '';
       let stableSince = 0;
       fileTimer = setInterval(() => {
         if (settled) return;
-        let hit = null;
-        try {
-          for (const name of fs.readdirSync(cwd)) {
-            if (name.startsWith('.')) continue;
-            if (!exts.includes(path.extname(name).toLowerCase())) continue;
-            const st = fs.statSync(path.join(cwd, name));
-            if (st.isFile() && st.size > 0) {
-              hit = { name, size: st.size };
-              break;
-            }
-          }
-        } catch {
-          /* 目录尚未就绪 */
-        }
-        if (!hit) {
-          stableName = null;
+        const hits = scanImageFiles();
+        if (!hits.length) {
+          stableKey = '';
           return;
         }
         fileSeen = true;
-        if (hit.name === stableName && hit.size === stableSize && Date.now() - stableSince >= (image.fileStableMs ?? 1500)) {
+        const key = hits.map((h) => `${h.dir}/${h.name}:${h.size}`).sort().join('|');
+        if (key === stableKey && Date.now() - stableSince >= (image.fileStableMs ?? 1500)) {
           setTimeout(() => {
             if (settled) return;
-            let files = [];
-            try {
-              files = fs
-                .readdirSync(cwd)
-                .filter((n) => !n.startsWith('.') && exts.includes(path.extname(n).toLowerCase()))
-                .filter((n) => fs.statSync(path.join(cwd, n)).size > 0);
-            } catch {
-              /* 忽略 */
-            }
+            const files = collectIntoCwd(scanImageFiles());
             if (!files.length) return; // 文件可能被改名，继续等
             finish(resolve, { output: files, meta: { durationMs: Date.now() - startedAt } });
             killProcessTree(child);
           }, 400);
-        } else if (hit.name !== stableName || hit.size !== stableSize) {
-          stableName = hit.name;
-          stableSize = hit.size;
+        } else if (key !== stableKey) {
+          stableKey = key;
           stableSince = Date.now();
         }
       }, 400);
       if (typeof fileTimer.unref === 'function') fileTimer.unref();
+
+      finalHarvest = () => {
+        const files = collectIntoCwd(scanImageFiles());
+        if (files.length) finish(resolve, { output: files, meta: { durationMs: Date.now() - startedAt } });
+        return files.length > 0;
+      };
     }
 
     child.on('error', (e) => {
@@ -420,6 +474,8 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
       }
 
       if (image) {
+        // 进程已自行结束：最后一轮收割（轮询间隔可能刚好没赶上文件稳定），收不到才报失败
+        if (finalHarvest && finalHarvest()) return;
         const agentSays = final && typeof final.output === 'string' && final.output.trim() ? `。工具回复：${final.output.trim().slice(0, 200)}` : '';
         return finish(
           reject,

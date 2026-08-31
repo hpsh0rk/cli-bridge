@@ -106,6 +106,12 @@ export function validateDeclaration(decl, context = '') {
       fail('image.fileStableMs 须为正整数');
     }
     if (im.toolName !== undefined && typeof im.toolName !== 'string') fail('image.toolName 须为字符串');
+    if (
+      im.searchDirs !== undefined &&
+      (!Array.isArray(im.searchDirs) || im.searchDirs.length === 0 || im.searchDirs.some((d) => typeof d !== 'string' || !d.trim()))
+    ) {
+      fail('image.searchDirs 须为非空字符串数组（额外语境目录，支持 ~ 前缀）');
+    }
   }
 }
 

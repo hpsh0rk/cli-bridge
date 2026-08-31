@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { startBridge, get, rawRequest } from './helpers.js';
 import { createToken } from '../src/core/tokens.js';
 import { composeInput } from '../src/server/openai.js';
@@ -216,6 +219,64 @@ test('错误响应带 CORS 头：白名单 Origin 可读信封，非白名单不
   });
   assert.equal(r.status, 403);
   assert.equal(r.headers['access-control-allow-origin'], undefined);
+});
+
+// 回归（2026-08-31 实测）：新版 agy 的 generate_image 把产物写进会话 brain 目录而非 cwd，
+// 桥须按 image.searchDirs 扫描额外语境目录收割，且只认 mtime 晚于 run 开始的文件。
+test('images/generations：searchDirs 外部目录收割 + 旧图防误收', async (t) => {
+  const sideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-brain-'));
+  t.after(() => fs.rmSync(sideDir, { recursive: true, force: true }));
+
+  // 写进 searchDir 子目录（模拟 agy brain/<会话>/ 布局）或根目录，两条扫描路径都要覆盖
+  const writeSide = (rel, bytes, mode) => `
+const fs = require('fs'), path = require('path');
+setTimeout(() => {
+  const p = path.join(${JSON.stringify(sideDir)}, ${JSON.stringify(rel)});
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, Buffer.from(${JSON.stringify(bytes)}));
+  ${mode === 'hang' ? 'setInterval(() => {}, 1000);' : 'process.exit(0);'}
+}, 400);
+`;
+  const sideAdapter = (code) => ({
+    displayName: 'Side Image Tool',
+    binary: process.execPath,
+    run: { args: ['-e', 'console.log("{}")', '{input}'], output: 'json', jsonResponsePath: 'x' },
+    stream: { args: ['-e', code, '{input}'] },
+    image: { extensions: ['.png'], fileStableMs: 300, toolName: 'generate_image', searchDirs: [sideDir] },
+    capabilities: { text: true, image: true, stream: true },
+    limits: { timeoutMs: 15000, concurrency: 1, outputMaxBytes: 8388608 },
+    options: [],
+  });
+  const cfg = {
+    auth: { requireToken: false },
+    tools: { allow: ['imgside-hang', 'imgside-exit', 'imgstale'] },
+    adapters: {
+      'imgside-hang': sideAdapter(writeSide('sess-hang/hang.png', 'side-hang-bytes', 'hang')),
+      'imgside-exit': sideAdapter(writeSide('exit.png', 'side-exit-bytes', 'exit')),
+      imgstale: sideAdapter(writeSide('nothing.png', '', 'exit')),
+    },
+  };
+  const { port } = await startBridge(t, { configPatch: cfg });
+
+  // 出图后挂住不退出：轮询从外部目录收割（成功后响应的 b64 来自 run 工作目录——证明外部文件已复制回 cwd）
+  let r = await rawRequest({ port, method: 'POST', path: '/v1/images/generations', headers: { 'Content-Type': 'application/json' }, body: { model: 'imgside-hang', prompt: 'x' } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(Buffer.from(r.json.data[0].b64_json, 'base64').toString(), 'side-hang-bytes');
+
+  // 写完立即退出：轮询未必赶上，close 兜底收割
+  r = await rawRequest({ port, method: 'POST', path: '/v1/images/generations', headers: { 'Content-Type': 'application/json' }, body: { model: 'imgside-exit', prompt: 'x' } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(Buffer.from(r.json.data[0].b64_json, 'base64').toString(), 'side-exit-bytes');
+
+  // 外部目录只有旧图（mtime 早于 run 开始）：不得收割，应报失败
+  const stale = path.join(sideDir, 'stale.png');
+  fs.writeFileSync(stale, Buffer.from('stale-bytes'));
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(stale, old, old);
+  r = await rawRequest({ port, method: 'POST', path: '/v1/images/generations', headers: { 'Content-Type': 'application/json' }, body: { model: 'imgstale', prompt: 'x' } });
+  assert.equal(r.status, 502);
+  assert.equal(r.json.error.code, 'E_TOOL_FAILED');
+  assert.equal(r.json.data, undefined);
 });
 
 test('composeInput：单轮直传 / system 前置 / 多轮转写', () => {

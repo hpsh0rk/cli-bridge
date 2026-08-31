@@ -243,6 +243,7 @@ async function run(toolId, input) {
 { "created": 1788099000, "data": [ { "url": "http://127.0.0.1:39487/v1/files/agy/r_01J…/image.png" } ] }
 ```
 
-- 实现机制：桥在隔离工作目录中驱动工具生成并把图片**落盘收割**（文件出现且尺寸稳定即视为完成，进程是否退出不重要）；适配器可声明图片生成工具名，该工具报错时桥快速失败返回 `E_TOOL_FAILED`（附 detail），不空耗超时。
+- 实现机制：桥在隔离工作目录中驱动工具生成并把图片**落盘收割**（文件出现且尺寸稳定即视为完成，进程是否退出不重要）；适配器可用 `image.searchDirs` 声明额外语境目录（如 agy 的 brain 会话目录——新版 `generate_image` 把产物写进 `~/.gemini/antigravity-cli/brain/<会话 id>/` 而非工作目录），桥会一并扫描并把命中文件复制回工作目录，只认 mtime 晚于本次运行开始的文件，避免误收历史产物；适配器可声明图片生成工具名，该工具报错时桥快速失败返回 `E_TOOL_FAILED`（附 detail），不空耗超时。
 - `url` 模式指向 `GET /v1/files/:tool/:runId/:file`，**需要 token 请求头**，因此 `<img>` 标签无法直接引用——浏览器展示请用 `b64_json`（data URI）；url 适合程序化下载。
 - 生成耗时波动大（数秒到数分钟），且依赖工具自身的图像能力与配额（agy 的 `generate_image` 实测存在配额限制）；失败会带明确错误信息，可稍后重试。
+- CORS 契约：OpenAI 兼容层（含 `/v1/models`、`/v1/chat/completions`、`/v1/images/generations`）的**成功与错误响应**都会带来源白名单的 CORS 头——错误信封必须让跨域页面读到，否则浏览器拦截响应、`fetch` 只抛 `TypeError`（表现为 HTTP 0），接入方拿不到真实错误码。

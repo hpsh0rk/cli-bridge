@@ -8,9 +8,12 @@
  *   {"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"…"}} 增量文本
  *   {"event":"result","result":{"status":"SUCCESS","response":"…","usage":{…}}}          最终结果
  *
- * 图片（实测注意）：agent 调 generate_image 工具产出图片落盘 cwd；该工具可能瞬时失败
- *   （疑配额限流，实测 3 次调用 1 成功 2 失败），失败时 agent 会转入无效 shell 兜底——
- *   桥据 image.toolName 快速失败；成功时进程可能挂住不退出，桥按"文件稳定即收割"处理。
+ * 图片（实测注意，2026-08-31 复核）：generate_image 产物写进会话 brain 目录
+ *   （~/.gemini/antigravity-cli/brain/<conversation_id>/，conversation_id 即 stdout JSON 里的会话 id），
+ *   不再落盘 cwd（8/30 的旧实测结论已失效）——桥据 image.searchDirs 扫描 brain 会话目录收割，
+ *   按 mtime 晚于 run 开始过滤，避免误收旧会话产物。该工具可能瞬时失败（疑配额限流），
+ *   失败时 agent 会转入无效 shell 兜底——桥据 image.toolName 快速失败；
+ *   成功时进程可能挂住不退出，桥按"文件稳定即收割"处理。
  *   文件写入需要 --dangerously-skip-permissions（非交互模式下无法响应权限询问）。
  */
 export default {
@@ -43,6 +46,7 @@ export default {
     extensions: ['.png', '.jpg', '.jpeg', '.webp'],
     fileStableMs: 2000,
     toolName: 'generate_image',
+    searchDirs: ['~/.gemini/antigravity-cli/brain'],
   },
   capabilities: { text: true, image: true, stream: true },
   limits: { timeoutMs: 300000, concurrency: 1, outputMaxBytes: 8388608 },
