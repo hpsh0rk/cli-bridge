@@ -182,6 +182,42 @@ test('images/generations：n>1 / 非图片工具 被拒绝；generate_image 失�
   assert.ok(Date.now() - started < 5000, '应在工具报错后快速失败，而不是等超时');
 });
 
+// 回归：OpenAI 兼容层的错误响应必须带 CORS 头，否则白名单页面跨域时浏览器拦截响应，
+// fetch 抛 TypeError，在线调试台只能看到 HTTP 0 而非真实错误（如 429 配额耗尽）。
+test('错误响应带 CORS 头：白名单 Origin 可读信封，非白名单不带', async (t) => {
+  const cfg = { ...adapterPatch(), origins: ['https://sh0rk.cn'] };
+  const { port } = await startBridge(t, { configPatch: cfg });
+  const headers = { 'Content-Type': 'application/json', Origin: 'https://sh0rk.cn' };
+
+  // images/generations：参数校验错误（400）
+  let r = await rawRequest({ port, method: 'POST', path: '/v1/images/generations', headers, body: { model: 'img', prompt: 'x', n: 2 } });
+  assert.equal(r.status, 400);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://sh0rk.cn');
+  assert.equal(r.json.error.code, 'E_BAD_REQUEST');
+
+  // images/generations：工具失败透传（502，真实场景即 429 配额耗尽）
+  r = await rawRequest({ port, method: 'POST', path: '/v1/images/generations', headers, body: { model: 'imgfail', prompt: 'x' } });
+  assert.equal(r.status, 502);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://sh0rk.cn');
+  assert.equal(r.json.error.code, 'E_TOOL_FAILED');
+
+  // chat/completions：错误信封同样带 CORS
+  r = await rawRequest({ port, method: 'POST', path: '/v1/chat/completions', headers, body: { model: 'nope', messages: [{ role: 'user', content: 'x' }] } });
+  assert.equal(r.status, 404);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://sh0rk.cn');
+
+  // 非白名单 Origin：维持原行为，不给 ACAO（浏览器侧本就该拦）
+  r = await rawRequest({
+    port,
+    method: 'POST',
+    path: '/v1/images/generations',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+    body: { model: 'img', prompt: 'x', n: 2 },
+  });
+  assert.equal(r.status, 403);
+  assert.equal(r.headers['access-control-allow-origin'], undefined);
+});
+
 test('composeInput：单轮直传 / system 前置 / 多轮转写', () => {
   assert.equal(composeInput([{ role: 'user', content: '你好' }]), '你好');
   assert.equal(

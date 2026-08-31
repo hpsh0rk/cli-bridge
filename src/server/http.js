@@ -241,7 +241,8 @@ export function createRequestHandler({ config, engine, version, verbose = false 
         if (!req.readableEnded) res.once('finish', () => req.destroy());
         return;
       }
-      sendJson(res, 500, { ok: false, error: { code: 'E_INTERNAL', message: '服务内部错误', retryable: false } });
+      // 兜底 500 同样要带 CORS：白名单页面跨域时，缺头会让浏览器拦截响应，客户端只能看到网络错误
+      sendJson(res, 500, { ok: false, error: { code: 'E_INTERNAL', message: '服务内部错误', retryable: false } }, cors);
     }
   };
 }

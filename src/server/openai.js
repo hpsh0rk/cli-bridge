@@ -39,10 +39,16 @@ export function openaiErrorPayload(be) {
   };
 }
 
-function sendOpenAiError(res, be) {
+// 错误响应也必须带 CORS 头：跨域页面（在线调试台/第三方接入）只有读到响应体才能拿到错误信封，
+// 缺头时浏览器整体拦截、fetch 抛 TypeError，用户只能看到 HTTP 0 而非真实原因（如 429 配额耗尽）。
+function sendOpenAiError(res, be, cors = {}) {
   const { status, body } = openaiErrorPayload(be);
   const payload = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(payload) });
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    ...cors,
+  });
   res.end(payload);
 }
 
@@ -109,13 +115,13 @@ export function createOpenAiHandlers({ config, engine }) {
     try {
       body = await readJsonBody(req, config.limits.maxBodyBytes);
     } catch (e) {
-      return sendOpenAiError(res, e);
+      return sendOpenAiError(res, e, cors);
     }
     if (typeof body.model !== 'string' || !body.model) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'model is required（填工具 id，如 "agy"）'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'model is required（填工具 id，如 "agy"）'), cors);
     }
     if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.some((m) => !m || typeof m !== 'object')) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'messages is required（OpenAI chat 格式数组）'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'messages is required（OpenAI chat 格式数组）'), cors);
     }
     const input = composeInput(body.messages);
     const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -177,7 +183,7 @@ export function createOpenAiHandlers({ config, engine }) {
         usage: mapUsage(out.data.meta?.usage) ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       }, cors);
     } catch (e) {
-      return sendOpenAiError(res, e);
+      return sendOpenAiError(res, e, cors);
     }
   }
 
@@ -186,21 +192,21 @@ export function createOpenAiHandlers({ config, engine }) {
     try {
       body = await readJsonBody(req, config.limits.maxBodyBytes);
     } catch (e) {
-      return sendOpenAiError(res, e);
+      return sendOpenAiError(res, e, cors);
     }
     if (typeof body.model !== 'string' || !body.model) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'model is required（填图片工具 id，如 "agy"）'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'model is required（填图片工具 id，如 "agy"）'), cors);
     }
     if (typeof body.prompt !== 'string' || !body.prompt.trim()) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'prompt is required'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'prompt is required'), cors);
     }
     const n = body.n ?? 1;
     if (n !== 1) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'only n=1 is supported（本桥单次产出一张图）'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'only n=1 is supported（本桥单次产出一张图）'), cors);
     }
     const responseFormat = body.response_format ?? 'b64_json';
     if (!['b64_json', 'url'].includes(responseFormat)) {
-      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'response_format must be "b64_json" or "url"'));
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'response_format must be "b64_json" or "url"'), cors);
     }
     // size / quality / style 等参数静默忽略：CLI 工具不保证按精确尺寸产出（协议文档已注明）
 
@@ -208,7 +214,7 @@ export function createOpenAiHandlers({ config, engine }) {
     try {
       out = await engine.run({ toolId: body.model, input: body.prompt, mode: 'image', origin, tokenKey, tokenAudit });
     } catch (e) {
-      return sendOpenAiError(res, e);
+      return sendOpenAiError(res, e, cors);
     }
     const runId = out.data.runId;
     const files = Array.isArray(out.data.output) ? out.data.output : [];
@@ -225,7 +231,7 @@ export function createOpenAiHandlers({ config, engine }) {
     const safe = (s) => typeof s === 'string' && s.length > 0 && !s.includes('..') && !s.includes('/') && !s.includes('\\');
     const full = safe(toolId) && safe(runId) && safe(file) ? path.join(workspaceRoot(), toolId, runId, file) : null;
     if (!full || !fs.existsSync(full) || !fs.statSync(full).isFile()) {
-      return sendOpenAiError(res, new BridgeError('E_NOT_FOUND', 'file not found or expired'));
+      return sendOpenAiError(res, new BridgeError('E_NOT_FOUND', 'file not found or expired'), cors);
     }
     const type = FILE_TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream';
     const stat = fs.statSync(full);
