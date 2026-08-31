@@ -55,6 +55,8 @@ cli-bridge tools allow agy            # ① 启用工具（默认全关，交互
 cli-bridge origins add https://your-site.com   # ② 允许哪个网站连（仅 https）
 cli-bridge token create --origin https://your-site.com   # ③ 签发 token（粘贴进网页）
 cli-bridge run agy "你好"             # 本机快捷调用（走 UDS，免 token）
+cli-bridge stop                       # 停桥（依据 ~/.cli-bridge/bridge.pid）
+cli-bridge restart                    # 停 + 在前台重启（配置改完常用；[--port N] 同 start）
 ```
 
 ## 浏览器演示页
@@ -203,6 +205,7 @@ open("out.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 - **测试会不会动我的 agy 授权？** 不会。`npm test` 默认零外部调用；真实 agy 端到端需要 `npm run test:agy` 显式开启。
 - **Windows 可用吗？** 代码已含命名管道（`\\.\pipe\cli-bridge`）分支，但未在 Windows 上实测，欢迎反馈。
 - **桥开机自启**：用系统守护机制托管 `cli-bridge start`（如 macOS launchd / systemd），桥自身不内置守护。
+- **改完配置要重启**：`origins add`、端口/限流调整等改完后用 `cli-bridge restart`——进程内默认 SIGTERM 优雅关闭、5s 未退会 SIGKILL。stop/restart 只读 pid 文件，**不扫描进程、不按端口猜**——杀错进程的风险为零；旧版本实例（无 pid 文件）手动结束一次、升级后即生效。
 
 ## 给维护者：发布流程
 
@@ -233,7 +236,7 @@ npm run test:agy:image  # 再加图片生成 e2e（受 agy 图片配额影响）
 
 ```
 bin/cli-bridge.js        # 可执行入口
-src/cli.js               # 命令行：start/tools/origins/token/config/doctor/run
+src/cli.js               # 命令行：start/stop/restart/tools/origins/token/config/doctor/run
 src/core/                # config · tokens · runner · queue · runs · engine · audit
 src/adapters/            # registry + agy/codex 声明
 src/server/              # http（HTTP 通道）· uds（UDS 通道）· openai（OpenAI 兼容层）· body

@@ -29,6 +29,9 @@ export function socketPath() {
     ? '\\\\.\\pipe\\cli-bridge'
     : path.join(bridgeDir(), 'bridge.sock');
 }
+export function pidPath() {
+  return path.join(bridgeDir(), 'bridge.pid');
+}
 
 export function defaultConfig() {
   return deepClone({

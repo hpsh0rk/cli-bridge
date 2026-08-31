@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import http from 'node:http';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
@@ -11,6 +12,7 @@ import {
   tokensPath,
   auditLogPath,
   socketPath,
+  pidPath,
 } from './core/config.js';
 import { buildRegistry, findBinary } from './adapters/registry.js';
 import { Scheduler } from './core/queue.js';
@@ -126,7 +128,7 @@ async function cmdStart(flags) {
     });
   } catch (e) {
     if (e.code === 'EADDRINUSE') {
-      console.error(`启动失败：127.0.0.1:${config.server.port} 已被占用。换端口启动：cli-bridge start --port <N>`);
+      console.error(`启动失败：127.0.0.1:${config.server.port} 已被占用——多半已有桥在运行，用 cli-bridge restart 原地重启，或 cli-bridge stop 后再 start。换端口：cli-bridge start --port <N>`);
       process.exitCode = 1;
       return;
     }
@@ -159,11 +161,14 @@ async function cmdStart(flags) {
   console.log(`  工具   ${allowNote}`);
   console.log(`  来源   ${originsNote}`);
   console.log(`  限制   ${config.limits.runsPerMinute} 次/分钟 · 队列 ${config.limits.queueDepth} · 请求体上限 ${Math.round(config.limits.maxBodyBytes / 1024)}KB`);
-  console.log(`  协议   docs/PROTOCOL.md · 诊断 cli-bridge doctor`);
+  console.log(`  协议   docs/PROTOCOL.md · 诊断 cli-bridge doctor · 停止 cli-bridge stop`);
   for (const w of warnings) console.log(`  ⚠ ${w}`);
+
+  writePidFile(config.server.port);
 
   const shutdown = () => {
     console.log('\n正在关闭…');
+    clearOwnPidFile();
     httpServer.close();
     try {
       uds.close();
@@ -182,6 +187,104 @@ async function cmdStart(flags) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+}
+
+// ── stop / restart ───────────────────────────────────────────────────────
+
+// stop/restart 只认 pid 文件：不扫进程、不按端口猜，杀错进程的风险为零。
+// 旧版本实例（无 pid 文件）手动结束一次，升级即生效；残留 socket 由
+// startUdsChannel 启动时自愈（探测连不通才清理）。
+function writePidFile(port) {
+  fs.mkdirSync(path.dirname(pidPath()), { recursive: true });
+  fs.writeFileSync(pidPath(), JSON.stringify({ pid: process.pid, port, startedAt: new Date().toISOString() }, null, 2));
+}
+
+function clearOwnPidFile() {
+  try {
+    const rec = JSON.parse(fs.readFileSync(pidPath(), 'utf8'));
+    if (rec.pid === process.pid) fs.unlinkSync(pidPath());
+  } catch {
+    /* 无文件或已损坏 */
+  }
+}
+
+function readPidFile() {
+  try {
+    const rec = JSON.parse(fs.readFileSync(pidPath(), 'utf8'));
+    return Number.isInteger(rec?.pid) ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** SIGTERM 优雅关闭，5s 超时后 SIGKILL。返回是否确实停掉了实例。 */
+function killPid(pid) {
+  return new Promise((resolve) => {
+    console.log(`正在停止桥（pid ${pid}）…`);
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      return resolve(false);
+    }
+    const deadline = Date.now() + 5000;
+    const tick = () => {
+      if (!alive(pid)) {
+        console.log('已停止。');
+        return resolve(true);
+      }
+      if (Date.now() > deadline) {
+        try {
+          process.kill(pid, 'SIGKILL');
+          console.log('5s 未退出，已强制结束。');
+        } catch {
+          /* 已退出 */
+        }
+        return resolve(true);
+      }
+      setTimeout(tick, 150);
+    };
+    setTimeout(tick, 150);
+  });
+}
+
+async function cmdStop() {
+  const rec = readPidFile();
+  if (!rec) {
+    console.log('桥未在运行（无 pid 文件）。若跑的是旧版本实例，请手动结束这一次，升级后 stop/restart 即正常。');
+    return;
+  }
+  if (!alive(rec.pid)) {
+    console.log(`pid 文件指向的进程（${rec.pid}）已不存在，清理残留文件。`);
+    try {
+      fs.unlinkSync(pidPath());
+    } catch {
+      /* 忽略 */
+    }
+    return;
+  }
+  if (await killPid(rec.pid)) {
+    try {
+      fs.unlinkSync(pidPath());
+    } catch {
+      /* 忽略 */
+    }
+  }
+}
+
+async function cmdRestart(flags) {
+  const rec = readPidFile();
+  if (rec && alive(rec.pid)) await killPid(rec.pid);
+  else if (rec) console.log('pid 文件指向的进程已不存在，直接启动。');
+  return cmdStart(flags);
 }
 
 // ── tools / origins / token / config ─────────────────────────────────────
@@ -625,6 +728,8 @@ function printHelp() {
   config get [key]             查看配置（无 key 输出全部）
   config set <key> <value>     修改配置（schema 校验后原子写入）
   doctor                       体检：配置/工具/端口/桥状态
+  stop                         停止运行中的桥（依据 ~/.cli-bridge/bridge.pid）
+  restart                      重启桥 = 停旧 + 在本终端前台 start（[--port N] 同 start）
   run <tool> <input>           本机快捷调用（走 UDS 免 token）[--json] [--timeout-ms N]
 
 协议与网页接入：docs/PROTOCOL.md`);
@@ -657,6 +762,10 @@ export async function main(argv = process.argv.slice(2)) {
       return cmdConfig(sub, positional);
     case 'doctor':
       return cmdDoctor();
+    case 'stop':
+      return cmdStop();
+    case 'restart':
+      return cmdRestart(flags);
     case 'run':
       return cmdRun(sub, positional, flags);
     case 'help':

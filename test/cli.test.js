@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
 import { useTempHome } from './helpers.js';
 import { main, splitCommand } from '../src/cli.js';
 import { loadConfig } from '../src/core/config.js';
@@ -92,4 +94,88 @@ test('config 文件只写进沙箱 HOME，绝不碰 CWD', async (t) => {
   await main(['config', 'set', 'server.port', '4321']);
   assert.ok(fs.existsSync(path.join(home, '.cli-bridge', 'config.json')));
   assert.ok(!fs.existsSync(path.join(scratch, '.cli-bridge')), 'CWD 不产生任何配置');
+});
+
+// ── stop / restart（子进程端到端：真实端口 + 信号，无法在进程内模拟）──────
+
+const BIN = fileURLToPath(new URL('../bin/cli-bridge.js', import.meta.url));
+
+async function waitUntil(fn, { timeoutMs = 10000, step = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await fn()) return;
+    await new Promise((r) => setTimeout(r, step));
+  }
+  throw new Error('waitUntil 超时');
+}
+
+async function healthOk(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/health`);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+function exited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+test('stop：pid 文件优雅关闭并清理；无实例时提示未在运行', async (t) => {
+  const home = useTempHome(t);
+  const port = 47100 + (process.pid % 400);
+  const env = { ...process.env, HOME: home };
+  const pidFile = path.join(home, '.cli-bridge', 'bridge.pid');
+
+  const bridge = spawn(process.execPath, [BIN, 'start', '--port', String(port)], { env, stdio: 'ignore' });
+  t.after(() => {
+    if (!exited(bridge)) bridge.kill('SIGKILL');
+  });
+
+  await waitUntil(() => fs.existsSync(pidFile));
+  await waitUntil(() => healthOk(port));
+  assert.equal(JSON.parse(fs.readFileSync(pidFile, 'utf8')).port, port);
+
+  const r = spawnSync(process.execPath, [BIN, 'stop'], { env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  await waitUntil(() => exited(bridge));
+  assert.ok(!fs.existsSync(pidFile), 'stop 后 pid 文件应清理');
+  assert.equal(await healthOk(port), false, '端口应已释放');
+
+  const r2 = spawnSync(process.execPath, [BIN, 'stop'], { env, encoding: 'utf8' });
+  assert.equal(r2.status, 0);
+  assert.match(r2.stdout, /未在运行/);
+});
+
+test('restart：停旧实例，restart 进程原地成为新桥', async (t) => {
+  const home = useTempHome(t);
+  const port = 47600 + (process.pid % 400);
+  const env = { ...process.env, HOME: home };
+  const pidFile = path.join(home, '.cli-bridge', 'bridge.pid');
+
+  const a = spawn(process.execPath, [BIN, 'start', '--port', String(port)], { env, stdio: 'ignore' });
+  t.after(() => {
+    if (!exited(a)) a.kill('SIGKILL');
+  });
+  await waitUntil(() => fs.existsSync(pidFile));
+  const pidA = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+  await waitUntil(() => healthOk(port));
+
+  const b = spawn(process.execPath, [BIN, 'restart', '--port', String(port)], { env, stdio: 'ignore' });
+  t.after(() => {
+    if (!exited(b)) b.kill('SIGKILL');
+  });
+
+  await waitUntil(() => {
+    if (!fs.existsSync(pidFile)) return false;
+    return JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid === b.pid;
+  });
+  await waitUntil(() => healthOk(port));
+  assert.notEqual(b.pid, pidA, '新桥应是 restart 进程自己');
+  assert.ok(exited(a), '旧实例应已退出');
+
+  const r = spawnSync(process.execPath, [BIN, 'stop'], { env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  await waitUntil(() => exited(b));
 });
