@@ -1,7 +1,7 @@
 # cli-bridge 接入协议 v1
 
-> 版本：1.0（稳定契约）· 更新时间：2026-08-30
-> 适用：cli-bridge v0.1.x。协议按语义版本演进：v1 内只增不改——新增字段与错误码向后兼容，破坏性变更会升主版本并保留旧版端点。
+> 版本：1.1（稳定契约）· 更新时间：2026-08-31
+> 适用：cli-bridge v0.3.x。协议按语义版本演进：v1 内只增不改——新增字段与错误码向后兼容，破坏性变更会升主版本并保留旧版端点。
 >
 > 接入方只需要本文件 + 固定默认端口（39487）+ 一次性 `tools allow` 配置。底层是 agy、codex 还是任何其他 CLI，对接入方完全不可见。
 
@@ -78,8 +78,8 @@ curl --unix-socket ~/.cli-bridge/bridge.sock http://localhost/v1/tools
   {
     "id": "agy",
     "displayName": "Antigravity CLI",
-    "capabilities": { "text": true, "image": false, "stream": false },
-    "optionsSchema": [],               // 页面可传的选项白名单（v1 内置适配器均为空）
+    "capabilities": { "text": true, "image": false, "stream": false, "conversation": false },
+    "optionsSchema": [],               // 页面可传的选项白名单（如 agy 的 conversationId）
     "available": true,                 // 二进制是否已安装
     "installHint": "…",                // 仅 available=false 时出现
     "untested": true                   // 仅声明未实测的适配器出现（如 codex）
@@ -87,7 +87,7 @@ curl --unix-socket ~/.cli-bridge/bridge.sock http://localhost/v1/tools
 ] }
 ```
 
-只返回白名单内启用的工具。
+只返回白名单内启用的工具。`capabilities.conversation` 为 true 表示该工具支持多轮会话续聊（OpenAI 兼容层自动使用，见 §7.2）。
 
 ### 4.3 `POST /v1/tools/:id/run`（需 token）
 
@@ -96,7 +96,8 @@ curl --unix-socket ~/.cli-bridge/bridge.sock http://localhost/v1/tools
 ```jsonc
 {
   "input": "你好",              // 必填，非空字符串；唯一的自由文本，只会填入工具命令模板的 {input} 槽位
-  "options": { "model": "…" },  // 可选；逐项过该工具的选项白名单，白名单外的键直接 400
+  "options": { "conversationId": "…" }, // 可选；逐项过该工具的选项白名单，白名单外的键直接 400。
+                                 // agy 支持 conversationId（映射为 --conversation，续聊指定会话）
   "wait": true,                 // 默认 true 同步等待；false → 202 + runId（异步）
   "timeoutMs": 120000           // 可选整数，不超过适配器上限（超出 → 400）
 }
@@ -108,7 +109,8 @@ curl --unix-socket ~/.cli-bridge/bridge.sock http://localhost/v1/tools
 { "ok": true, "data": {
     "runId": "r_01J…", "status": "succeeded",
     "output": "你好！请问……",      // 工具输出按适配器声明提取
-    "meta": { "durationMs": 3062, "exitCode": 0, "usage": { "total_tokens": 29148 } }
+    "meta": { "durationMs": 3062, "exitCode": 0, "usage": { "total_tokens": 29148 },
+              "conversationId": "025a193f…" }   // 工具会话 id（仅声明会话能力的工具有）；可回填到 options.conversationId 实现多轮续聊
 } }
 ```
 
@@ -227,9 +229,15 @@ async function run(toolId, input) {
 
 请求同 OpenAI：`model`（= 工具 id）、`messages`、`stream`、`stream_options.include_usage`；`temperature` 等其余参数静默忽略。
 
-- **messages → input 映射**：多轮对话拍平为带角色标签的转写（`System: …\n\nUser: …\n\nAssistant: …`，CLI 是单次调用、无服务端会话态）；无 assistant 消息时 system 原样前置、用户内容直传；content 支持分段数组（取 text 部分）。
-- **同步响应**：标准 `chat.completion` 对象；`usage` 由工具上报映射（`input_tokens → prompt_tokens` 等，未上报则为 0）。
-- **流式响应**（SSE，`Content-Type: text/event-stream`）：`chat.completion.chunk` 序列 —— 首块 `delta:{role:"assistant"}`（含**桥扩展字段 `bridge_run_id`**，OpenAI 客户端会忽略；接入方可用它调 `POST /v1/runs/:id/cancel` 取消流式运行）→ 若干 `delta:{content}`（**真增量**，来自 CLI 的流式输出）→ `finish_reason:"stop"` → `include_usage` 时追加 `choices:[]` 的用量块 → `data: [DONE]`。中途失败发 `data:{"error":{…}}` 后仍以 `[DONE]` 收尾。
+- **messages → input 映射（多轮会话续聊）**：
+  - **首轮 / 单轮**：无 assistant 消息时 system 原样前置、用户内容直传，不加标签；content 支持分段数组（取 text 部分）。
+  - **多轮自动续聊**：请求历史含 assistant 回复、且新增的是末条 user 消息时，桥按「对话前缀 → 工具会话」映射查上一轮的会话 id——命中则**只把新增消息发给 CLI**（如 agy 的 `--conversation <id>` 续聊），上游 prompt cache（KV cache）因此复用，token 花费显著降低（实测 agy 续聊轮 input 33981 中 24480 来自缓存）；未命中（首轮多轮、历史被编辑/分支、映射过期）回退为带角色标签的整段转写（`System: …\n\nUser: …\n\nAssistant: …`），行为退化为 v1 基线。
+  - 会话映射由桥在服务端维护（LRU 200 条、2 小时过期），接入方**零改动**即可受益；多轮聊天前端照常每轮重发完整 messages 即可。
+  - 已知退化：工具侧会话被清理时，续聊轮会在新会话上进行（该轮上下文缺失但请求成功），桥会把新会话 id 登记进映射，后续轮次继续链接。
+- **响应桥扩展字段**：顶层（同步）与 stop / usage 块（流式）带 `bridge_conversation_id`（本轮所属工具会话 id），供接入方观测续聊是否生效；OpenAI 客户端会忽略未知字段。
+- **usage 映射**：`usage` 由工具上报映射——`prompt_tokens = input_tokens + cache_read_tokens`（OpenAI 语义 prompt 含缓存命中部分）、`completion_tokens = output_tokens`、`total_tokens` 为完整总量；缓存命中时附 `prompt_tokens_details.cached_tokens`。注意工具侧 `result.usage` 为会话累计值，续聊轮的数字会随轮次增长。
+- **同步响应**：标准 `chat.completion` 对象。
+- **流式响应**（SSE，`Content-Type: text/event-stream`）：`chat.completion.chunk` 序列 —— 首块 `delta:{role:"assistant"}`（含**桥扩展字段 `bridge_run_id`**，OpenAI 客户端会忽略；接入方可用它调 `POST /v1/runs/:id/cancel` 取消流式运行）→ 若干 `delta:{content}`（**真增量**，来自 CLI 的流式输出）→ `finish_reason:"stop"`（含 `bridge_conversation_id`）→ `include_usage` 时追加 `choices:[]` 的用量块 → `data: [DONE]`。中途失败发 `data:{"error":{…}}` 后仍以 `[DONE]` 收尾。
 - 流式能力由适配器声明（agy 经 `--output-format stream-json` 实测为真增量）。
 
 ### 7.3 `POST /v1/images/generations`

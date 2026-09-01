@@ -296,3 +296,119 @@ test('composeInput：单轮直传 / system 前置 / 多轮转写', () => {
   ]);
   assert.equal(multi, 'System: S\n\nUser: U1\n\nAssistant: A1\n\nUser: U2');
 });
+
+// ─── 多轮会话续聊（KV cache 复用）───
+// fake CLI 模拟 agy 实测行为：收到 --conversation 时回显「续聊 + 增量输入」，
+// 固定返回 conversation_id，并上报带 cache_read_tokens 的用量（input 与 cache 不重叠）。
+const CONV_CODE = `
+const args = process.argv.slice(1);
+const input = args[0] || '';
+const ci = args.indexOf('--conversation');
+const conv = ci !== -1 ? args[ci + 1] : '';
+const text = (conv ? 'resumed:' + conv + '|' : 'fresh:') + input;
+setTimeout(() => console.log(JSON.stringify({ event: 'step_update', step_update: { step_type: 'agent_response', text_delta: text } })), 30);
+setTimeout(() => {
+  console.log(JSON.stringify({ event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-fixed-1', response: text, usage: { input_tokens: conv ? 5 : 100, output_tokens: 2, cache_read_tokens: conv ? 20 : 0, total_tokens: conv ? 7 : 102 } } }));
+  process.exit(0);
+}, 90);
+`;
+
+function convConfig() {
+  return {
+    auth: { requireToken: false },
+    tools: { allow: ['conv'] },
+    adapters: {
+      conv: {
+        displayName: 'Conv Tool',
+        binary: process.execPath,
+        run: {
+          args: ['-e', CONV_CODE, '{input}'],
+          output: 'json',
+          jsonResponsePath: 'response',
+          jsonStatusPath: 'status',
+          jsonStatusSuccess: ['SUCCESS'],
+          jsonConversationIdPath: 'conversation_id',
+          usagePath: 'usage',
+        },
+        stream: {
+          args: ['-e', CONV_CODE, '{input}'],
+          deltas: { when: { event: 'step_update', 'step_update.step_type': 'agent_response' }, path: 'step_update.text_delta' },
+          final: {
+            when: { event: 'result' },
+            outputPath: 'result.response',
+            statusPath: 'result.status',
+            successValues: ['SUCCESS'],
+            usagePath: 'result.usage',
+            conversationIdPath: 'result.conversation_id',
+          },
+        },
+        capabilities: { text: true, image: false, stream: true, conversation: true },
+        limits: { timeoutMs: 30000, concurrency: 1, outputMaxBytes: 8388608 },
+        options: [{ name: 'conversationId', flag: '--conversation', type: 'string' }],
+      },
+    },
+  };
+}
+
+test('多轮会话续聊：首轮转写开新会话，第二轮前缀命中只发增量', async (t) => {
+  const { port } = await startBridge(t, { configPatch: convConfig() });
+  const send = (messages) =>
+    rawRequest({ port, method: 'POST', path: '/v1/chat/completions', headers: { 'Content-Type': 'application/json' }, body: { model: 'conv', messages } });
+
+  // 首轮（单轮直传）：开新会话，响应带桥扩展 bridge_conversation_id
+  let r = await send([{ role: 'user', content: 'U1' }]);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.choices[0].message.content, 'fresh:U1');
+  assert.equal(r.json.bridge_conversation_id, 'conv-fixed-1');
+  assert.deepEqual(r.json.usage, { prompt_tokens: 100, completion_tokens: 2, total_tokens: 102 });
+
+  // 第二轮（真实客户端行为：重发完整历史）→ 前缀命中 → 只发 U2 + --conversation 续聊
+  r = await send([
+    { role: 'user', content: 'U1' },
+    { role: 'assistant', content: 'fresh:U1' },
+    { role: 'user', content: 'U2' },
+  ]);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.choices[0].message.content, 'resumed:conv-fixed-1|U2');
+  assert.equal(r.json.bridge_conversation_id, 'conv-fixed-1');
+  // 缓存命中用量映射（OpenAI 语义 prompt 含缓存部分）：input 5 + cached 20 = prompt 25
+  assert.deepEqual(r.json.usage, { prompt_tokens: 25, completion_tokens: 2, total_tokens: 27, prompt_tokens_details: { cached_tokens: 20 } });
+
+  // 历史对不上（分支/编辑过）：miss → 回退整段转写，行为退化为 v1 基线
+  r = await send([
+    { role: 'user', content: 'OTHER' },
+    { role: 'assistant', content: 'X' },
+    { role: 'user', content: 'U2' },
+  ]);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.choices[0].message.content, 'fresh:User: OTHER\n\nAssistant: X\n\nUser: U2');
+});
+
+test('多轮会话续聊（SSE）：stop/usage 块带 bridge_conversation_id 与缓存用量', async (t) => {
+  const { port } = await startBridge(t, { configPatch: convConfig() });
+  const send = (messages) =>
+    rawRequest({
+      port,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      body: { model: 'conv', messages, stream: true, stream_options: { include_usage: true } },
+    });
+  let r = await send([{ role: 'user', content: 'U1' }]);
+  assert.equal(r.status, 200);
+  r = await send([
+    { role: 'user', content: 'U1' },
+    { role: 'assistant', content: 'fresh:U1' },
+    { role: 'user', content: 'U2' },
+  ]);
+  assert.equal(r.status, 200);
+  const events = r.text.split('\n\n').filter((s) => s.startsWith('data: ')).map((s) => s.slice(6));
+  const chunks = events.slice(0, -1).map((s) => JSON.parse(s));
+  const content = chunks.filter((c) => c.choices[0]?.delta?.content).map((c) => c.choices[0].delta.content).join('');
+  assert.equal(content, 'resumed:conv-fixed-1|U2');
+  const stop = chunks.find((c) => c.choices[0]?.finish_reason === 'stop');
+  assert.equal(stop.bridge_conversation_id, 'conv-fixed-1');
+  const usageChunk = chunks.find((c) => c.choices.length === 0 && c.usage);
+  assert.equal(usageChunk.bridge_conversation_id, 'conv-fixed-1');
+  assert.equal(usageChunk.usage.prompt_tokens_details.cached_tokens, 20);
+});

@@ -139,3 +139,36 @@ test('取消：进程组被杀后以 E_CANCELLED 收尾', async (t) => {
     (e) => e instanceof BridgeError && e.code === 'E_CANCELLED'
   );
 });
+
+test('会话续聊：选项白名单映射为 --conversation argv；conversation_id 提取进 meta', async (t) => {
+  useTempHome(t);
+  // fake CLI 回显是否收到 --conversation 及其值，模拟 agy 的会话行为
+  const script = `
+const a = process.argv;
+const ci = a.indexOf('--conversation');
+console.log(JSON.stringify({
+  response: ci !== -1 ? 'resumed:' + a[ci + 1] : 'fresh',
+  status: 'SUCCESS',
+  conversation_id: ci !== -1 ? a[ci + 1] : 'new-conv-id',
+}));
+`;
+  const decl = jsonDecl({
+    run: {
+      args: ['-e', script, '{input}'],
+      output: 'json',
+      jsonResponsePath: 'response',
+      jsonStatusPath: 'status',
+      jsonStatusSuccess: ['SUCCESS'],
+      jsonConversationIdPath: 'conversation_id',
+    },
+    options: [{ name: 'conversationId', flag: '--conversation', type: 'string' }],
+  });
+  // 首轮（无 conversationId）：开新会话，返回新 id
+  const fresh = await execAdapter({ decl, input: 'hi', options: {}, timeoutMs: 30000, runId: 'rc0' });
+  assert.equal(fresh.output, 'fresh');
+  assert.equal(fresh.meta.conversationId, 'new-conv-id');
+  // 续聊轮（带 conversationId）：选项映射为 argv，id 回流 meta
+  const resumed = await execAdapter({ decl, input: 'hi', options: { conversationId: 'conv-42' }, timeoutMs: 30000, runId: 'rc1' });
+  assert.equal(resumed.output, 'resumed:conv-42');
+  assert.equal(resumed.meta.conversationId, 'conv-42');
+});

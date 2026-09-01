@@ -15,6 +15,12 @@
  *   失败时 agent 会转入无效 shell 兜底——桥据 image.toolName 快速失败；
  *   成功时进程可能挂住不退出，桥按"文件稳定即收割"处理。
  *   文件写入需要 --dangerously-skip-permissions（非交互模式下无法响应权限询问）。
+ *
+ * 多轮会话（实测 2026-08-31）：`--conversation <id>` 续聊指定会话，stdout JSON 与 stream-json
+ *   的 result/init 事件都带 conversation_id。续聊轮上游复用 prompt cache（KV cache）——
+ *   实测第二轮 input_tokens 33981 中 cache_read_tokens 24480。注意 usage 口径：
+ *   input_tokens 不含缓存命中部分（两者相加才是完整 prompt），result.usage 是会话累计值。
+ *   续聊不存在的会话 id 不报错：stderr 警告后开新会话（上下文丢失但仍 SUCCESS）。
  */
 export default {
   id: 'agy',
@@ -29,6 +35,7 @@ export default {
     jsonStatusPath: 'status',
     jsonStatusSuccess: ['SUCCESS'],
     usagePath: 'usage',
+    jsonConversationIdPath: 'conversation_id',
   },
   stream: {
     args: ['-p', '{input}', '--output-format', 'stream-json'],
@@ -39,6 +46,7 @@ export default {
       statusPath: 'result.status',
       successValues: ['SUCCESS'],
       usagePath: 'result.usage',
+      conversationIdPath: 'result.conversation_id',
     },
   },
   image: {
@@ -48,8 +56,8 @@ export default {
     toolName: 'generate_image',
     searchDirs: ['~/.gemini/antigravity-cli/brain'],
   },
-  capabilities: { text: true, image: true, stream: true },
+  capabilities: { text: true, image: true, stream: true, conversation: true },
   limits: { timeoutMs: 300000, concurrency: 1, outputMaxBytes: 8388608 },
-  options: [],
+  options: [{ name: 'conversationId', flag: '--conversation', type: 'string' }],
 };
 

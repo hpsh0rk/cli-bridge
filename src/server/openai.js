@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BridgeError } from '../errors.js';
 import { readJsonBody } from './body.js';
 import { workspaceRoot } from '../core/config.js';
+import { createSessionStore, sessionKey } from '../core/sessions.js';
 
 /**
  * OpenAI 兼容层（协议见 docs/PROTOCOL.md §7）：
@@ -13,6 +14,8 @@ import { workspaceRoot } from '../core/config.js';
  *
  * 错误响应用 OpenAI 信封 {"error":{message,type,code,param}}，接入方按 OpenAI 语义处理。
  * 目标是"无缝接入"：openai 官方 SDK / 各类聊天前端把 base_url 指到本桥即可。
+ * 多轮对话自动走工具会话续聊（如 agy --conversation）：只把新增消息发给 CLI，
+ * 上游 prompt cache（KV cache）因此复用；会话映射见 src/core/sessions.js。
  */
 
 const ERROR_TYPES = {
@@ -63,7 +66,7 @@ function sendJson(res, status, body, extraHeaders = {}) {
   res.end(payload);
 }
 
-/** OpenAI messages → 桥 input。多轮对话拍平成带角色标签的转写（CLI 是单次调用，无会话态）。 */
+/** OpenAI messages → 桥 input。多轮对话拍平成带角色标签的转写。 */
 export function composeInput(messages) {
   const text = (c) => {
     if (typeof c === 'string') return c;
@@ -81,15 +84,40 @@ export function composeInput(messages) {
   return convo.map((m) => `${label[m.role] || m.role}: ${m.content}`).join('\n\n');
 }
 
-function mapUsage(usage) {
-  if (!usage || typeof usage !== 'object') return undefined;
-  const input = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0);
-  const output = Number(usage.output_tokens ?? usage.completion_tokens ?? 0);
-  const total = Number(usage.total_tokens ?? input + output);
-  return { prompt_tokens: input, completion_tokens: output, total_tokens: total };
+/**
+ * 多轮请求的会话续聊输入（协议见 docs/PROTOCOL.md §7.2）：
+ * 历史含 assistant 回复、且新增的是末条 user 消息时，查会话映射——命中则只发
+ * 新增消息（CLI 用 --conversation 续聊，上游复用 KV cache）；miss / 首轮 /
+ * 末条非 user 时回退整段转写（v1 基线行为）。返回 { input, conversationId? }。
+ */
+export function resolveConversationInput({ model, messages, sessions }) {
+  const text = (c) => {
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.filter((p) => p && p.type === 'text' && p.text).map((p) => p.text).join('\n');
+    return '';
+  };
+  const last = messages[messages.length - 1];
+  if (last && last.role === 'user' && messages.some((m) => m.role === 'assistant')) {
+    const hit = sessions.find(sessionKey(model, composeInput(messages.slice(0, -1))));
+    if (hit) return { input: text(last.content), conversationId: hit };
+  }
+  return { input: composeInput(messages) };
 }
 
-function chunkLine(id, created, model, delta, finishReason, usage, bridgeRunId) {
+function mapUsage(usage) {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const cached = Math.max(0, Number(usage.cache_read_tokens ?? 0)) || 0; // 工具口径：与 input_tokens 不重叠
+  const input = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0);
+  const output = Number(usage.output_tokens ?? usage.completion_tokens ?? 0);
+  return {
+    prompt_tokens: input + cached, // OpenAI 语义：prompt_tokens 含缓存命中部分
+    completion_tokens: output,
+    total_tokens: (usage.total_tokens !== undefined ? Number(usage.total_tokens) : input + cached + output) + cached,
+    ...(cached > 0 ? { prompt_tokens_details: { cached_tokens: cached } } : {}),
+  };
+}
+
+function chunkLine(id, created, model, delta, finishReason, usage, bridgeRunId, bridgeConversationId) {
   const chunk = {
     id,
     object: 'chat.completion.chunk',
@@ -99,12 +127,13 @@ function chunkLine(id, created, model, delta, finishReason, usage, bridgeRunId) 
   };
   if (usage) chunk.usage = usage;
   if (bridgeRunId) chunk.bridge_run_id = bridgeRunId; // 桥扩展字段：OpenAI 客户端会忽略；网页端用于取消运行
+  if (bridgeConversationId) chunk.bridge_conversation_id = bridgeConversationId; // 桥扩展字段：本轮所属工具会话
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
 const FILE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
 
-export function createOpenAiHandlers({ config, engine }) {
+export function createOpenAiHandlers({ config, engine, sessions = createSessionStore() }) {
   function models(res, cors) {
     const data = engine.listTools().filter((t) => t.available).map((t) => ({ id: t.id, object: 'model', created: 0, owned_by: 'cli-bridge' }));
     return sendJson(res, 200, { object: 'list', data }, cors);
@@ -123,10 +152,27 @@ export function createOpenAiHandlers({ config, engine }) {
     if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.some((m) => !m || typeof m !== 'object')) {
       return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'messages is required（OpenAI chat 格式数组）'), cors);
     }
-    const input = composeInput(body.messages);
+    // 多轮自动会话续聊：命中历史前缀 → 只发新增消息 + --conversation（见 resolveConversationInput）
+    const { input, conversationId: resumedId } = resolveConversationInput({ model: body.model, messages: body.messages, sessions });
     const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const created = Math.floor(Date.now() / 1000);
-    const runOpts = { toolId: body.model, input, origin, tokenKey, tokenAudit };
+    const runOpts = {
+      toolId: body.model,
+      input,
+      options: resumedId ? { conversationId: resumedId } : undefined,
+      origin,
+      tokenKey,
+      tokenAudit,
+    };
+    // 成功后把「完整历史 + 本轮回复」登记为下一轮的前缀键；会话丢失（CLI 侧已清理）时
+    // CLI 会警告后开新会话，此处存回新 id，后续轮次在（缺上下文的）新会话上继续链。
+    const remember = (out) => {
+      const convId = out?.data?.meta?.conversationId;
+      if (!convId) return undefined;
+      const next = [...body.messages, { role: 'assistant', content: String(out.data.output ?? '') }];
+      sessions.save(sessionKey(body.model, composeInput(next)), convId);
+      return convId;
+    };
 
     if (body.stream === true) {
       res.writeHead(200, {
@@ -156,12 +202,23 @@ export function createOpenAiHandlers({ config, engine }) {
         });
         write(chunkLine(id, created, body.model, { role: 'assistant', content: '' }, null, undefined, bridgeRunId));
         const out = await outP;
-        write(chunkLine(id, created, body.model, {}, 'stop', undefined, bridgeRunId));
+        const convId = remember(out);
+        write(chunkLine(id, created, body.model, {}, 'stop', undefined, bridgeRunId, convId));
         // OpenAI 规范：stream_options.include_usage 时，末尾追加 choices 为空的用量块
         if (body.stream_options?.include_usage) {
           const usage = mapUsage(out.data.meta?.usage);
           if (usage) {
-            write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: body.model, choices: [], usage })}\n\n`);
+            write(
+              `data: ${JSON.stringify({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model: body.model,
+                choices: [],
+                usage,
+                ...(convId ? { bridge_conversation_id: convId } : {}),
+              })}\n\n`
+            );
           }
         }
         write('data: [DONE]\n\n');
@@ -174,6 +231,7 @@ export function createOpenAiHandlers({ config, engine }) {
 
     try {
       const out = await engine.run({ ...runOpts, mode: 'stream' });
+      const convId = remember(out);
       return sendJson(res, 200, {
         id,
         object: 'chat.completion',
@@ -181,6 +239,7 @@ export function createOpenAiHandlers({ config, engine }) {
         model: body.model,
         choices: [{ index: 0, message: { role: 'assistant', content: String(out.data.output ?? '') }, finish_reason: 'stop' }],
         usage: mapUsage(out.data.meta?.usage) ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        ...(convId ? { bridge_conversation_id: convId } : {}),
       }, cors);
     } catch (e) {
       return sendOpenAiError(res, e, cors);

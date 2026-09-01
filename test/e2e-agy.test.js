@@ -103,6 +103,35 @@ test('真实 agy：OpenAI 兼容层流式聊天（慢，验证真增量 SSE）',
   assert.ok(usageChunk && usageChunk.usage.total_tokens > 0, 'include_usage 应产出用量块');
 });
 
+test('真实 agy：OpenAI 兼容层多轮会话续聊（KV cache 复用，慢，约 10-60s）', { skip: SKIP }, async (t) => {
+  const { port } = await startBridge(t, {
+    configPatch: { auth: { requireToken: false }, tools: { allow: ['agy'] } },
+  });
+  const send = (messages) =>
+    rawRequest({
+      port,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { 'Content-Type': 'application/json' },
+      body: { model: 'agy', messages, stream_options: { include_usage: true } },
+    });
+  const r1 = await send([{ role: 'user', content: '记住暗号是芒果7号。只回复：已记住' }]);
+  assert.equal(r1.status, 200, r1.text);
+  assert.ok(r1.json.bridge_conversation_id, '首轮应返回工具会话 id（bridge_conversation_id）');
+  const convId = r1.json.bridge_conversation_id;
+
+  // 第二轮重发完整历史（真实 OpenAI 客户端行为）：桥应识别前缀 → 会话续聊 → 记住上下文
+  const r2 = await send([
+    { role: 'user', content: '记住暗号是芒果7号。只回复：已记住' },
+    { role: 'assistant', content: r1.json.choices[0].message.content },
+    { role: 'user', content: '暗号是什么？只回复暗号本身' },
+  ]);
+  assert.equal(r2.status, 200, r2.text);
+  assert.ok(/芒果7号/.test(r2.json.choices[0].message.content), `第二轮应续聊同一会话并答对暗号，实际：${r2.json.choices[0].message.content}`);
+  assert.equal(r2.json.bridge_conversation_id, convId, '两轮应属于同一工具会话');
+  assert.ok(r2.json.usage.prompt_tokens_details?.cached_tokens > 0, '续聊轮应命中上游 prompt cache（cached_tokens > 0）');
+});
+
 test('真实 agy：图片生成（依赖 agy 图片配额，实测时好时坏；CLI_BRIDGE_IMAGE_E2E=1 开启）', { skip: hasAgy && AGY_E2E && process.env.CLI_BRIDGE_IMAGE_E2E ? false : '需 CLI_BRIDGE_AGY_E2E=1 且 CLI_BRIDGE_IMAGE_E2E=1（generate_image 有配额限制，实测 3 次调用 1 成功 2 失败）' }, async (t) => {
   const { port } = await startBridge(t, {
     configPatch: { auth: { requireToken: false }, tools: { allow: ['agy'] } },

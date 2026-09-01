@@ -61,7 +61,7 @@ cli-bridge restart                    # 停 + 在前台重启（配置改完常�
 
 ## 浏览器演示页
 
-桥自带一个同源控制台，零配置在浏览器里跑通全流程（粘贴 token → 选工具 → 运行/取消）：
+桥自带一个同源控制台，零配置在浏览器里跑通全流程（粘贴 token → 选工具 → 运行/取消 → 多轮对话/图片生成）：
 
 ```bash
 cli-bridge token create --origin local   # 签发本机 token
@@ -77,7 +77,8 @@ open http://127.0.0.1:39487/
 - **一键复制安装命令**，照着引导装好并启动桥；
 - **检测桥状态**（`GET /v1/health`），未装 / 未启动 / 被浏览器本地网络权限拦截都有对应提示；
 - **配对向导**按你当前访问的页面 origin 动态生成 `origins add` 与 `token create` 命令，token 验证后只存本浏览器；
-- **调试控制台**拉取工具白名单，同步 / 异步（SSE 事件流）两种模式运行，支持取消；
+- **调试控制台**拉取工具白名单，同步 / 异步（SSE 事件流）两种模式运行，支持取消，另有图像生成模式；
+- **多轮对话 demo**：像真实 OpenAI 客户端一样多轮聊天，直观展示会话续聊与每轮「缓存命中」的 token 数（见下文 OpenAI 兼容层）；
 - 页面底部有**原始请求日志**，每个请求的 URL、状态码、耗时与响应体都可展开复制。
 
 适合快速测试、排查接入问题，也可以当第三方网页接入的实现参考（页面源码在 [personal-site](https://github.com/hpsh0rk/personal-site) 的 `apps/web/src/pages/tools/cli-bridge.astro`）。
@@ -129,7 +130,7 @@ curl --unix-socket ~/.cli-bridge/bridge.sock \
 
 ## 适配器：内置与自定义
 
-内置：`agy`（flags 已实测）、`codex`（本机未安装，按官方文档声明，标记**未实测**；`npm i -g @openai/codex` 装好后 `available` 自动变为 true）。
+内置：`agy`（flags 已实测；支持流式、图片生成、多轮会话续聊）、`codex`（本机未安装，按官方文档声明，标记**未实测**；`npm i -g @openai/codex` 装好后 `available` 自动变为 true）。
 
 **新增/修正工具不用改代码**——在 `adapters` 段写声明即可，示例：
 
@@ -140,7 +141,7 @@ curl --unix-socket ~/.cli-bridge/bridge.sock \
       "displayName": "Claude Code",
       "binary": "claude",
       "run": { "args": ["-p", "{input}", "--output-format", "json"], "output": "json", "jsonResponsePath": "result", "usagePath": "usage" },
-      "capabilities": { "text": true, "image": false, "stream": false },
+      "capabilities": { "text": true, "image": false, "stream": false, "conversation": false },
       "limits": { "timeoutMs": 300000, "concurrency": 1, "outputMaxBytes": 8388608 },
       "options": []
     }
@@ -150,6 +151,8 @@ curl --unix-socket ~/.cli-bridge/bridge.sock \
 ```
 
 约束（schema 校验强制）：`run.args` 里 `{input}` 必须恰好出现一次且为独立 argv 元素（无 shell、无字符串拼接）；`output` 支持 `json`（`jsonResponsePath` 提取 + 可选 status 校验）、`ndjson`（`ndjsonPick` 选事件 + `ndjsonTextPath` 提取）、`text`。每次运行在 `~/.cli-bridge/workspace/<tool>/<runId>/` 下执行，超时/取消杀整个进程组。
+
+**多轮会话续聊**（可选能力）：声明 `capabilities.conversation: true` + `options` 里的 `conversationId` 选项（映射为续聊 flag，如 agy 的 `--conversation`），并在输出声明里加 `jsonConversationIdPath`（json 模式）/ `stream.final.conversationIdPath`（stream 模式）提取工具回传的会话 id——OpenAI 兼容层即自动获得多轮续聊（见 `src/adapters/agy.js` 的完整示例）。
 
 ## 安全模型速览
 
@@ -177,6 +180,16 @@ stream = client.chat.completions.create(model="agy", messages=[{"role": "user", 
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="")
 
+# 多轮对话：照常每轮重发完整 messages，桥自动续聊同一会话——
+# 只把新增消息发给 CLI，上游 KV cache 复用，token 花费显著降低
+# （实测 agy 第二轮 input 33981 中 24480 来自缓存，见 usage.prompt_tokens_details.cached_tokens）
+msgs = [{"role": "user", "content": "记住暗号是芒果7号"}]
+msgs.append({"role": "assistant", "content": client.chat.completions.create(model="agy", messages=msgs).choices[0].message.content})
+msgs.append({"role": "user", "content": "暗号是什么？"})
+r2 = client.chat.completions.create(model="agy", messages=msgs)
+print(r2.choices[0].message.content)          # 芒果7号（续聊同一会话，无需重发上下文）
+print(r2.usage.prompt_tokens_details.cached_tokens)  # 本轮从缓存读取的 token 数
+
 # 图片生成（OpenAI Images 协议）
 img = client.images.generate(model="agy", prompt="一只戴帽子的柴犬")
 open("out.png", "wb").write(base64.b64decode(img.data[0].b64_json))
@@ -185,7 +198,7 @@ open("out.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 | 端点 | 说明 |
 |---|---|
 | `GET /v1/models` | 白名单内可用工具 → model 列表 |
-| `POST /v1/chat/completions` | 同步 + SSE 流式；多轮 messages 拍平为带角色转写（CLI 单次调用无会话态）；temperature 等参数静默忽略 |
+| `POST /v1/chat/completions` | 同步 + SSE 流式；多轮 messages 自动走会话续聊（如 agy `--conversation`），只把新增消息发给 CLI，复用上游 KV cache 省 token；前缀不匹配回退整段转写；响应带桥扩展 `bridge_conversation_id`，usage 含 `prompt_tokens_details.cached_tokens`；temperature 等参数静默忽略 |
 | `POST /v1/images/generations` | 仅 `n=1`；默认 `b64_json`；`response_format:"url"` 返回 `/v1/files/...`（取文件需带 token 头，`<img>` 标签用不了 URL，请用 b64）；size 等参数静默忽略 |
 | `GET /v1/files/:tool/:runId/:file` | 图片文件取回（需 token 头） |
 
@@ -225,8 +238,8 @@ git tag v0.1.x && git push origin v0.1.x
 ## 测试
 
 ```bash
-npm test              # 61 个用例，零外部依赖、零 agy 调用（约 10s，绝不会弹授权页）
-npm run test:agy      # 显式运行真实 agy 端到端（原生 + OpenAI 双协议）
+npm test              # 80 个用例，零外部依赖、零 agy 调用（约 12s，绝不会弹授权页）
+npm run test:agy      # 显式运行真实 agy 端到端（原生 + OpenAI 双协议 + 多轮会话续聊）
 npm run test:agy:image  # 再加图片生成 e2e（受 agy 图片配额影响）
 ```
 
@@ -237,10 +250,10 @@ npm run test:agy:image  # 再加图片生成 e2e（受 agy 图片配额影响）
 ```
 bin/cli-bridge.js        # 可执行入口
 src/cli.js               # 命令行：start/stop/restart/tools/origins/token/config/doctor/run
-src/core/                # config · tokens · runner · queue · runs · engine · audit
+src/core/                # config · tokens · runner · queue · runs · engine · sessions · audit
 src/adapters/            # registry + agy/codex 声明
 src/server/              # http（HTTP 通道）· uds（UDS 通道）· openai（OpenAI 兼容层）· body
-public/index.html        # 桥自带控制台页（文本流式 / 图片生成）
+public/index.html        # 桥自带控制台页（文本流式 / 多轮对话 / 图片生成）
 test/                    # 测试（node:test）
 docs/PROTOCOL.md         # 对外协议契约（原生 v1 + OpenAI 兼容层）
 skills/cli-bridge/       # AI Agent Skill
@@ -252,6 +265,6 @@ AGENTS.md                # AI 协作开发规范
 
 ## 路线
 
-- **v1（当前）**：双通道、适配器、配置系统、per-origin token、runs API + SSE、doctor、审计、Skill。
+- **v1（当前）**：双通道、适配器、配置系统、per-origin token、runs API + SSE、doctor、审计、Skill、多轮会话续聊（KV cache 复用）。
 - **v1.1**：图片类适配器输出、流式输出、平台二进制、JS SDK。
 - **v2**：自动配对页、per-token scope、MCP 网关、降权沙箱执行。

@@ -92,7 +92,8 @@ function extractOutput(decl, stdoutBuf, { exitCode, truncated }) {
     }
     const value = getPath(obj, decl.run.jsonResponsePath);
     if (value === undefined) fail(`无法从输出提取 ${decl.run.jsonResponsePath}${preview ? `，预览：${preview}` : ''}`);
-    return { value, usage: decl.run.usagePath ? getPath(obj, decl.run.usagePath) : undefined };
+    const conversationId = decl.run.jsonConversationIdPath ? getPath(obj, decl.run.jsonConversationIdPath) : undefined;
+    return { value, usage: decl.run.usagePath ? getPath(obj, decl.run.usagePath) : undefined, conversationId };
   }
 
   // ndjson：取最后一条匹配 ndjsonPick（点路径 → 期望值）的行
@@ -184,8 +185,14 @@ export function execAdapter({ decl, input, options, timeoutMs, runId, isCancelle
         );
       }
       try {
-        const { value, usage } = extractOutput(decl, stdout, { exitCode: code, truncated });
-        const meta = { durationMs, exitCode: code, ...(usage !== undefined ? { usage } : {}), ...(truncated ? { truncated } : {}) };
+        const { value, usage, conversationId } = extractOutput(decl, stdout, { exitCode: code, truncated });
+        const meta = {
+          durationMs,
+          exitCode: code,
+          ...(usage !== undefined ? { usage } : {}),
+          ...(conversationId !== undefined ? { conversationId } : {}),
+          ...(truncated ? { truncated } : {}),
+        };
         resolve({ output: value, meta });
       } catch (e) {
         if (e instanceof BridgeError) {
@@ -319,6 +326,7 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
           output: getPath(ev, st.final.outputPath),
           usage: st.final.usagePath ? getPath(ev, st.final.usagePath) : undefined,
           status: st.final.statusPath ? getPath(ev, st.final.statusPath) : undefined,
+          conversationId: st.final.conversationIdPath ? getPath(ev, st.final.conversationIdPath) : undefined,
         };
       }
       if (image && image.toolName && !fileSeen) {
@@ -516,7 +524,12 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
       }
       finish(resolve, {
         output: final.output,
-        meta: { durationMs, exitCode: code, ...(final.usage !== undefined ? { usage: final.usage } : {}) },
+        meta: {
+          durationMs,
+          exitCode: code,
+          ...(final.usage !== undefined ? { usage: final.usage } : {}),
+          ...(final.conversationId !== undefined ? { conversationId: final.conversationId } : {}),
+        },
       });
     });
   });

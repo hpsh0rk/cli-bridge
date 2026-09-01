@@ -73,6 +73,17 @@
   .out img { max-width: 100%; border-radius: 8px; display: block; margin: 6px 0; }
   .out img + img { margin-top: 10px; }
   [hidden] { display: none !important; }
+  .chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow-y: auto; }
+  .chat-msg { padding: 10px 12px; border-radius: 8px; background: rgba(127,127,127,.14); }
+  @media (prefers-color-scheme: dark) { .chat-msg { background: rgba(127,127,127,.18); } }
+  .chat-msg.user { background: rgba(37,99,235,.16); }
+  @media (prefers-color-scheme: dark) { .chat-msg.user { background: rgba(37,99,235,.28); } }
+  .chat-role { font-size: 11px; opacity: .55; display: block; margin-bottom: 4px; font-weight: 600; }
+  .chat-msg.err { background: #fee2e2; white-space: pre-wrap; }
+  @media (prefers-color-scheme: dark) { .chat-msg.err { background: #450a0a; } }
+  .chat-row { display: flex; gap: 8px; align-items: flex-end; }
+  .chat-row textarea { flex: 1; resize: vertical; }
+  .chat-row button { margin-top: 0; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -104,6 +115,19 @@
     <button id="cancelBtn" class="ghost" hidden>停止</button>
     <div id="out" class="out">（结果会显示在这里，流式输出并渲染 Markdown）</div>
     <p class="meta" id="meta"></p>
+  </section>
+
+  <section id="chatBox" hidden>
+    <label>多轮对话 demo（会话续聊 · KV cache 复用）</label>
+    <p class="hint" id="chatHint"></p>
+    <div id="chatLog" class="out chat-log"><p style="opacity:.55">（对话会显示在这里。试着第一轮让它记住一个暗号，第二轮只问暗号——续聊轮的「缓存命中」就是省下的重复计算。）</p></div>
+    <div class="chat-row" style="margin-top:12px">
+      <textarea id="chatInput" rows="2" placeholder="继续对话…（⌘/Ctrl + Enter 发送）"></textarea>
+      <button id="chatSend">发送</button>
+      <button id="chatStop" class="ghost" hidden>停止</button>
+    </div>
+    <button id="chatClear" class="ghost" style="margin-top:8px">清空对话</button>
+    <p class="meta" id="chatMeta"></p>
   </section>
 </main>
 
@@ -219,6 +243,7 @@ async function connect() {
   $('authBox').hidden = true;
   $('workBox').hidden = false;
   updateModeBox();
+  initChat();
   setStatus('已连接：' + state.tools.filter((x) => x.available).length + ' 个工具可用', true);
 }
 
@@ -372,6 +397,133 @@ async function runImage() {
   if (!failMsg && totalKB) $('meta').textContent = ((Date.now() - started) / 1000).toFixed(1) + 's · ' + totalKB + 'KB';
 }
 
+// ── 多轮对话 demo：像真实 OpenAI 客户端一样每轮重发完整 messages；桥端按
+// 「对话前缀 → 工具会话」映射自动续聊（agy --conversation），只把新增消息发给
+// CLI，上游 prompt cache（KV cache）因此复用——usage 里的缓存命中即证据。──
+const chat = { messages: [], running: false, runId: null, ctrl: null, timer: null };
+
+function chatCapHint() {
+  const t = selectedTool();
+  const can = !!(t && t.capabilities && t.capabilities.conversation);
+  $('chatHint').textContent = can
+    ? '该工具支持会话续聊：桥按对话前缀自动续接同一会话，只把新增消息发给 CLI，上游 KV cache 复用使 token 花费更低——「缓存命中」即本轮从缓存读取的 token 数。'
+    : '当前工具未声明会话续聊能力：每轮把完整历史拍平转写重发（无缓存复用）。';
+}
+
+function chatBubble(role, html, cls) {
+  const div = document.createElement('div');
+  div.className = 'chat-msg' + (cls ? ' ' + cls : '');
+  const tag = document.createElement('span');
+  tag.className = 'chat-role';
+  tag.textContent = role;
+  const body = document.createElement('div');
+  body.innerHTML = html;
+  div.append(tag, body);
+  $('chatLog').appendChild(div);
+  $('chatLog').scrollTop = $('chatLog').scrollHeight;
+  return body;
+}
+
+function setChatBusy(busy) {
+  chat.running = busy;
+  $('chatSend').disabled = busy;
+  $('chatStop').hidden = !busy;
+}
+
+async function chatSend() {
+  if (chat.running) return;
+  const text = $('chatInput').value.trim();
+  if (!text) return;
+  chat.running = true;
+  setChatBusy(true);
+  $('chatInput').value = '';
+  if ($('chatLog').querySelector('.chat-log-empty-note')) $('chatLog').innerHTML = '';
+  chat.messages.push({ role: 'user', content: text });
+  chatBubble('你', escapeHtml(text));
+  const started = Date.now();
+  chat.timer = setInterval(() => { $('chatMeta').textContent = '思考中… ' + ((Date.now() - started) / 1000).toFixed(1) + 's'; }, 200);
+  const body = chatBubble('助手', '…');
+  let raw = '';
+  let usage = null;
+  let convId = null;
+  let failMsg = null;
+  chat.ctrl = new AbortController();
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-bridge-token': state.token },
+      body: JSON.stringify({ model: $('tool').value, messages: chat.messages, stream: true, stream_options: { include_usage: true } }),
+      signal: chat.ctrl.signal,
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => null);
+      failMsg = friendlyError((b && b.error) || { code: 'HTTP_' + res.status, message: '请求失败' });
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const evt = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          const dataLine = evt.split('\n').find((l) => l.startsWith('data: '));
+          if (!dataLine) continue;
+          const data = dataLine.slice(6);
+          if (data === '[DONE]') continue;
+          let j;
+          try { j = JSON.parse(data); } catch { continue; }
+          if (j.error) { failMsg = friendlyError(j.error); continue; }
+          if (j.bridge_run_id) chat.runId = j.bridge_run_id;
+          if (j.bridge_conversation_id) convId = j.bridge_conversation_id;
+          const delta = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+          if (delta) { raw += delta; body.innerHTML = mdToHtml(raw); $('chatLog').scrollTop = $('chatLog').scrollHeight; }
+          if (j.usage) usage = j.usage;
+        }
+      }
+    }
+  } catch (e) {
+    failMsg = e.name === 'AbortError' ? '已停止（服务端工具进程已同时终止）' : '请求失败：' + e.message;
+  }
+  clearInterval(chat.timer);
+  setChatBusy(false);
+  chat.ctrl = null;
+  const secs = ((Date.now() - started) / 1000).toFixed(1);
+  if (failMsg !== null) {
+    chat.messages.pop(); // 本轮失败不进历史：重发即干净重试
+    body.className = 'err';
+    body.textContent = failMsg;
+    $('chatMeta').textContent = secs + 's';
+    return;
+  }
+  chat.messages.push({ role: 'assistant', content: raw });
+  const cached = usage && usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
+  $('chatMeta').textContent =
+    '第 ' + Math.floor(chat.messages.length / 2) + ' 轮 · ' + secs + 's' +
+    (usage && usage.prompt_tokens ? ' · prompt ' + usage.prompt_tokens + ' tokens' + (cached ? '（缓存命中 ' + cached + '）' : '') : '') +
+    (convId ? ' · 会话 ' + convId.slice(0, 8) : '');
+}
+
+function initChat() {
+  $('chatBox').hidden = false;
+  chatCapHint();
+  $('chatSend').onclick = chatSend;
+  $('chatStop').onclick = async () => {
+    if (chat.ctrl) chat.ctrl.abort();
+    if (chat.runId) await api('/v1/runs/' + chat.runId + '/cancel', { method: 'POST', body: '{}' });
+  };
+  $('chatClear').onclick = () => {
+    if (chat.running) return;
+    chat.messages = [];
+    $('chatLog').innerHTML = '<p style="opacity:.55">（对话会显示在这里。试着第一轮让它记住一个暗号，第二轮只问暗号——续聊轮的「缓存命中」就是省下的重复计算。）</p>';
+    $('chatMeta').textContent = '';
+  };
+  $('chatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) chatSend(); });
+}
+
 async function init() {
   $('token').value = state.token;
   $('connectBtn').onclick = connect;
@@ -382,7 +534,7 @@ async function init() {
   };
   $('modeText').onclick = () => setMode('text');
   $('modeImage').onclick = () => setMode('image');
-  $('tool').addEventListener('change', updateModeBox);
+  $('tool').addEventListener('change', () => { updateModeBox(); chatCapHint(); });
   $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run(); });
   try {
     const h = await api('/v1/health');
