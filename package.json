@@ -1,6 +1,6 @@
 {
   "name": "@sh0rk/cli-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "本机 CLI AI 工具的统一受控桥：网页 / 本地程序 / AI Agent 以一份稳定协议调用 agy、codex 等命令行工具",
   "type": "module",
   "bin": {
