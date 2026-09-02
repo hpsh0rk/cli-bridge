@@ -185,3 +185,72 @@ test('chat 多模态无附件路径回归：纯文本单轮不含清单段', asy
   assert.deepEqual(out.paths, []);
   assert.equal(out.argv.includes('--dangerously-skip-permissions'), false, '无附件不挂 extraArgs');
 });
+
+// —— images/generations 参考图（i2i） ——
+
+const IMAGE_OUT_CODE = `
+const fs = require('fs');
+setTimeout(() => {
+  fs.writeFileSync('out.png', Buffer.from('generated-image-bytes'));
+  const input = process.argv[1] || '';
+  fs.writeFileSync('last-input.txt', input);
+  setInterval(() => {}, 1000); // 模拟 agy 出图后挂住：验证"文件稳定即收割"
+}, 500);
+`;
+
+test('images/generations 带 image 参考图：附件落盘 + prompt 注入清单 + 收割产物（与参考图隔离）', async (t) => {
+  const cfg = visionConfig();
+  cfg.adapters.img2i = {
+    displayName: 'Image2Image Tool',
+    binary: process.execPath,
+    run: { args: ['-e', IMAGE_OUT_CODE, '{input}'], output: 'json', jsonResponsePath: 'response' },
+    stream: { args: ['-e', IMAGE_OUT_CODE, '{input}'] },
+    image: { extraArgs: ['--dangerously-skip-permissions'], extensions: ['.png'], fileStableMs: 400, toolName: 'generate_image', searchDirs: ['./nonexistent'] },
+    attachments: { extensions: ['.png', '.jpg'], maxCount: 2, maxBytes: 8388608, extraArgs: ['--dangerously-skip-permissions'] },
+    capabilities: { text: true, image: true, stream: true, attachments: true },
+    limits: { timeoutMs: 30000, concurrency: 1, outputMaxBytes: 8388608 },
+    options: [],
+  };
+  cfg.tools.allow.push('img2i');
+  const b = await startBridge(t, { configPatch: cfg });
+  const r = await post(b.port, '/v1/images/generations', {
+    model: 'img2i',
+    prompt: '按参考图风格画新图',
+    image: `data:image/jpeg;base64,${JPEG_BASE64}`,
+  });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.data.length, 1, '只收割生成产物一张');
+  assert.equal(r.json.data[0].b64_json, Buffer.from('generated-image-bytes').toString('base64'));
+  // 产物与参考图不混淆：参考图在 attachments/ 子目录，收割只看 cwd 本层
+  const runsDir = fs.readdirSync(path.join(b.home, '.cli-bridge', 'workspace', 'img2i'));
+  const runDir = path.join(b.home, '.cli-bridge', 'workspace', 'img2i', runsDir[0]);
+  const lastInput = fs.readFileSync(path.join(runDir, 'last-input.txt'), 'utf8');
+  assert.ok(lastInput.includes('[参考图片（本机文件，先用 view_file 查看，新图严格延续其视觉风格）]'), 'prompt 应注入参考图指令');
+  assert.ok(/attachments\/att-0\.jpg$/.test(lastInput.trim().split('\n').pop()), '清单应为 attachments/ 下绝对路径');
+  assert.ok(fs.existsSync(path.join(runDir, 'attachments', 'att-0.jpg')), '参考图应落盘');
+  assert.deepEqual(fs.readdirSync(runDir).filter((n) => n.endsWith('.png')), ['out.png'], 'cwd 本层只有生成产物');
+});
+
+test('images/generations：外链 image 400；image + n=1 语义保持', async (t) => {
+  const cfg = visionConfig();
+  cfg.adapters.img2i = {
+    displayName: 'Image2Image Tool',
+    binary: process.execPath,
+    run: { args: ['-e', IMAGE_OUT_CODE, '{input}'], output: 'json', jsonResponsePath: 'response' },
+    stream: { args: ['-e', IMAGE_OUT_CODE, '{input}'] },
+    image: { extraArgs: [], extensions: ['.png'], fileStableMs: 400, toolName: 'generate_image', searchDirs: ['./nonexistent'] },
+    attachments: { extensions: ['.png', '.jpg'], maxCount: 2, maxBytes: 8388608, extraArgs: [] },
+    capabilities: { text: true, image: true, stream: true, attachments: true },
+    limits: { timeoutMs: 30000, concurrency: 1, outputMaxBytes: 8388608 },
+    options: [],
+  };
+  cfg.tools.allow.push('img2i');
+  const b = await startBridge(t, { configPatch: cfg });
+  const bad = await post(b.port, '/v1/images/generations', {
+    model: 'img2i',
+    prompt: 'x',
+    image: 'https://example.com/ref.png',
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.json.error.code, 'E_BAD_REQUEST');
+});

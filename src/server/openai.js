@@ -304,7 +304,8 @@ export function createOpenAiHandlers({ config, engine, sessions = createSessionS
   async function imagesGenerations(req, res, cors, { origin, tokenKey, tokenAudit, localPort }) {
     let body;
     try {
-      body = await readJsonBody(req, config.limits.maxBodyBytes);
+      // 参考图以 data URL 内联：与 chat 同口径，请求体上限托底 20MB
+      body = await readJsonBody(req, Math.max(config.limits.maxBodyBytes, 20 * 1024 * 1024));
     } catch (e) {
       return sendOpenAiError(res, e, cors);
     }
@@ -322,11 +323,22 @@ export function createOpenAiHandlers({ config, engine, sessions = createSessionS
     if (!['b64_json', 'url'].includes(responseFormat)) {
       return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'response_format must be "b64_json" or "url"'), cors);
     }
+    // 参考图（参考图生成 / i2i 风格迁移）：data URL 内联，走附件管线落盘 + 绝对路径清单注入
+    let attachments;
+    try {
+      const images = body.image === undefined ? [] : Array.isArray(body.image) ? body.image : [body.image];
+      attachments = extractAttachments(images.map((url) => ({ role: 'user', content: [{ type: 'image_url', image_url: { url } }] })));
+    } catch (e) {
+      return sendOpenAiError(res, e, cors);
+    }
+    const input = attachments.length
+      ? `${body.prompt}\n\n[参考图片（本机文件，先用 view_file 查看，新图严格延续其视觉风格）]\n{attachments}`
+      : body.prompt;
     // size / quality / style 等参数静默忽略：CLI 工具不保证按精确尺寸产出（协议文档已注明）
 
     let out;
     try {
-      out = await engine.run({ toolId: body.model, input: body.prompt, mode: 'image', origin, tokenKey, tokenAudit });
+      out = await engine.run({ toolId: body.model, input, mode: 'image', attachments: attachments.length ? attachments : undefined, origin, tokenKey, tokenAudit });
     } catch (e) {
       return sendOpenAiError(res, e, cors);
     }

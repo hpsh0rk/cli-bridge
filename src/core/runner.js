@@ -315,7 +315,8 @@ export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelt
     const useStream = !!decl.stream;
     let args = (useStream ? decl.stream.args : decl.run.args).map((a) => (a === '{input}' ? finalInput : a));
     if (image && Array.isArray(decl.image?.extraArgs)) args = args.concat(decl.image.extraArgs);
-    if (attArgs.length) args = args.concat(attArgs);
+    // 去重附加：图片模式常已挂 skip-permissions，避免同一 flag 重复出现在 argv
+    for (const a of attArgs) if (!args.includes(a)) args.push(a);
     args = args.concat(optionsToArgs(decl, options));
     let child;
     try {

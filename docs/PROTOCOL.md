@@ -248,7 +248,9 @@ async function run(toolId, input) {
 
 ### 7.3 `POST /v1/images/generations`
 
-请求同 OpenAI Images：`model`（须为声明了 image 能力的工具）、`prompt`、可选 `response_format`（`"b64_json"` 默认 / `"url"`）、`n`（**仅支持 1**）；`size`/`quality` 等静默忽略（CLI 不保证精确尺寸）。
+请求同 OpenAI Images：`model`（须为声明了 image 能力的工具）、`prompt`、可选 `response_format`（`"b64_json"` 默认 / `"url"`）、`n`（**仅支持 1**）；`size`/`quality` 等静默忽略（CLI 不保证精确尺寸）。请求体上限与 chat 同口径（托底 20MB）。
+
+- **参考图 / i2i（v0.5.0 新增）**：可选 `image` 字段（data URL 字符串或其数组）→ 走附件管线：落盘 run 工作目录 `attachments/` 子目录，prompt 末尾追加绝对路径清单与「先 view_file 查看参考图、新图延续其视觉风格」指令；工具侧自行决定如何消费参考（agy 实测：agent 读图后调 generate_image，风格迁移成立）。仅接受 data URL 内联；数量/大小受适配器 `attachments` 能力约束。
 
 ```jsonc
 // 响应
