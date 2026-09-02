@@ -52,6 +52,39 @@ function unavailableError(decl) {
   });
 }
 
+/**
+ * 附件落盘（vision 输入）：写入 run 工作目录的 attachments/ 子目录——图片收割只扫 cwd 本层，
+ * 子目录隔离避免参考图被误收成生成产物。engine.validateRunRequest 已做数量/大小/类型校验，
+ * 这里只做落盘与文件名防御（正则排除路径分隔符，杜绝路径穿越）。
+ */
+function prepareAttachments(cwd, decl, attachments) {
+  const cap = decl.attachments;
+  if (!cap || !Array.isArray(attachments) || attachments.length === 0) return { paths: [], extraArgs: [] };
+  const dir = path.join(cwd, 'attachments');
+  fs.mkdirSync(dir, { recursive: true });
+  const paths = [];
+  for (const att of attachments) {
+    const name = String(att?.filename ?? '');
+    if (!/^att-\d+\.[A-Za-z0-9]+$/.test(name)) {
+      throw new BridgeError('E_BAD_REQUEST', `附件名非法：${name.slice(0, 40)}`);
+    }
+    const buf = Buffer.from(String(att?.dataBase64 ?? ''), 'base64');
+    if (!buf.length) throw new BridgeError('E_BAD_REQUEST', `附件解码后为空：${name}`);
+    const target = path.join(dir, name);
+    fs.writeFileSync(target, buf);
+    paths.push(target);
+  }
+  return { paths, extraArgs: Array.isArray(cap.extraArgs) ? cap.extraArgs : [] };
+}
+
+/** 输入中的 {attachments} 占位符 → 绝对路径清单（相对路径解析不可靠，实测 agent 会解析到 $HOME）。 */
+function composeInputWithAttachments(input, paths) {
+  if (!paths.length) return input.replaceAll('{attachments}', '');
+  const manifest = paths.join('\n');
+  if (input.includes('{attachments}')) return input.replaceAll('{attachments}', manifest);
+  return `${input}\n\n[随附图片文件（本机文件，可用 view_file 按绝对路径查看）]\n${manifest}`;
+}
+
 function tryParseJson(text) {
   try {
     return JSON.parse(text);
@@ -122,11 +155,22 @@ function extractOutput(decl, stdoutBuf, { exitCode, truncated }) {
  *   E_TOOL_UNAVAILABLE（二进制缺失）/ E_TIMEOUT / E_CANCELLED / E_TOOL_FAILED（附 stderrTail）。
  * 每次运行在 ~/.cli-bridge/workspace/<tool>/<runId>/ 下执行，隔离工具落盘行为。
  */
-export function execAdapter({ decl, input, options, timeoutMs, runId, isCancelled = () => false, onSpawn }) {
+export function execAdapter({ decl, input, options, timeoutMs, runId, attachments, isCancelled = () => false, onSpawn }) {
   return new Promise((resolve, reject) => {
-    const args = decl.run.args.map((a) => (a === '{input}' ? input : a)).concat(optionsToArgs(decl, options));
     const startedAt = Date.now();
     const cwd = makeRunDir(decl.id, runId);
+    let finalInput = input;
+    let attArgs = [];
+    try {
+      const prepared = prepareAttachments(cwd, decl, attachments);
+      finalInput = composeInputWithAttachments(input, prepared.paths);
+      attArgs = prepared.extraArgs;
+    } catch (e) {
+      return reject(e);
+    }
+    let args = decl.run.args.map((a) => (a === '{input}' ? finalInput : a));
+    if (attArgs.length) args = args.concat(attArgs);
+    args = args.concat(optionsToArgs(decl, options));
 
     let child;
     try {
@@ -255,15 +299,24 @@ function describeImageToolError(su) {
  *   且尚未出图时快速失败（实测 agent 会转入无效的 shell 兜底，空耗数分钟）。
  * 无 decl.stream 的适配器退化为缓冲执行，收尾走 extractOutput。
  */
-export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelta, image = null, isCancelled = () => false, onSpawn }) {
+export function execAdapterLive({ decl, input, options, timeoutMs, runId, onDelta, image = null, attachments, isCancelled = () => false, onSpawn }) {
   return new Promise((resolve, reject) => {
-    const useStream = !!decl.stream;
-    let args = (useStream ? decl.stream.args : decl.run.args).map((a) => (a === '{input}' ? input : a));
-    if (image && Array.isArray(decl.image?.extraArgs)) args = args.concat(decl.image.extraArgs);
-    args = args.concat(optionsToArgs(decl, options));
-
     const startedAt = Date.now();
     const cwd = makeRunDir(decl.id, runId);
+    let finalInput = input;
+    let attArgs = [];
+    try {
+      const prepared = prepareAttachments(cwd, decl, attachments);
+      finalInput = composeInputWithAttachments(input, prepared.paths);
+      attArgs = prepared.extraArgs;
+    } catch (e) {
+      return reject(e);
+    }
+    const useStream = !!decl.stream;
+    let args = (useStream ? decl.stream.args : decl.run.args).map((a) => (a === '{input}' ? finalInput : a));
+    if (image && Array.isArray(decl.image?.extraArgs)) args = args.concat(decl.image.extraArgs);
+    if (attArgs.length) args = args.concat(attArgs);
+    args = args.concat(optionsToArgs(decl, options));
     let child;
     try {
       child = spawn(decl.binary, args, {

@@ -227,8 +227,14 @@ async function run(toolId, input) {
 
 ### 7.2 `POST /v1/chat/completions`
 
-请求同 OpenAI：`model`（= 工具 id）、`messages`、`stream`、`stream_options.include_usage`；`temperature` 等其余参数静默忽略。
+请求同 OpenAI：`model`（= 工具 id）、`messages`、`stream`、`stream_options.include_usage`；`temperature` 等其余参数静默忽略。请求体上限：chat 端点为 `max(config.limits.maxBodyBytes, 20MB)`（图片 data URL 内联需要大请求体，其余端点仍按全局配置）。
 
+- **model 斜杠约定（v0.5.0 新增）**：`"<toolId>/<cliModel>"`（如 `"agy/claude-sonnet-4-6"`）→ 调用该工具并透传 `--model <cliModel>`（工具须在选项白名单声明 `model`）；前缀不是已知工具 id 时整体视为 toolId（保持旧行为）。响应与流式块回显客户端请求的原始 model 字符串。
+- **图片附件 / vision 输入（v0.5.0 新增）**：message `content` 数组支持 `{type:"image_url", image_url:{url:"data:image/png;base64,…"}}` 分段（OpenAI 多模态格式）。
+  - 仅接受 **data URL 内联**；http(s) 外链一律 400（UDS 通道按本机信任域设计，桥不做任意出网抓取）。
+  - **仅支持单轮**：messages 中含 assistant 历史时带图片直接 400（图片进会话前缀键会破坏续聊语义）。
+  - 桥把图片写入 run 工作目录 `attachments/` 子目录，输入文本末尾追加绝对路径清单（agy 实测相对路径会被解析到 $HOME）；适配器以 `attachments` 能力声明（扩展名/数量/单文件上限/extraArgs——agy 带附件时自动挂 `--dangerously-skip-permissions`，非交互下文件读取权限默认 deny）。附件目录与图片收割隔离，不会被误认成生成产物。
+- **`response_format`（v0.5.0 新增）**：`{type:"json_schema", json_schema:{name, schema}}` → 透传工具的 `--json-schema`（agy 在 stream-json 模式作用于最终 result）；其余取值静默忽略。
 - **messages → input 映射（多轮会话续聊）**：
   - **首轮 / 单轮**：无 assistant 消息时 system 原样前置、用户内容直传，不加标签；content 支持分段数组（取 text 部分）。
   - **多轮自动续聊**：请求历史含 assistant 回复、且新增的是末条 user 消息时，桥按「对话前缀 → 工具会话」映射查上一轮的会话 id——命中则**只把新增消息发给 CLI**（如 agy 的 `--conversation <id>` 续聊），上游 prompt cache（KV cache）因此复用，token 花费显著降低（实测 agy 续聊轮 input 33981 中 24480 来自缓存）；未命中（首轮多轮、历史被编辑/分支、映射过期）回退为带角色标签的整段转写（`System: …\n\nUser: …\n\nAssistant: …`），行为退化为 v1 基线。
@@ -251,7 +257,7 @@ async function run(toolId, input) {
 { "created": 1788099000, "data": [ { "url": "http://127.0.0.1:39487/v1/files/agy/r_01J…/image.png" } ] }
 ```
 
-- 实现机制：桥在隔离工作目录中驱动工具生成并把图片**落盘收割**（文件出现且尺寸稳定即视为完成，进程是否退出不重要）；适配器可用 `image.searchDirs` 声明额外语境目录（如 agy 的 brain 会话目录——新版 `generate_image` 把产物写进 `~/.gemini/antigravity-cli/brain/<会话 id>/` 而非工作目录），桥会一并扫描并把命中文件复制回工作目录，只认 mtime 晚于本次运行开始的文件，避免误收历史产物；适配器可声明图片生成工具名，该工具报错时桥快速失败返回 `E_TOOL_FAILED`（附 detail），不空耗超时。
+- 实现机制：桥在隔离工作目录中驱动工具生成并把图片**落盘收割**（文件出现且尺寸稳定即视为完成，进程是否退出不重要）；适配器可用 `image.searchDirs` 声明额外语境目录（如 agy 的 brain 会话目录——新版 `generate_image` 把产物写进 `~/.gemini/antigravity-cli/brain/<会话 id>/` 而非工作目录；claude 系模型实测写 `~/.gemini/antigravity-cli/scratch/`，均已收录），桥会一并扫描并把命中文件复制回工作目录，只认 mtime 晚于本次运行开始的文件，避免误收历史产物（run 工作目录的 `attachments/` 子目录不在扫描范围，参考图不会被误收成产物）；适配器可声明图片生成工具名，该工具报错时桥快速失败返回 `E_TOOL_FAILED`（附 detail），不空耗超时。
 - `url` 模式指向 `GET /v1/files/:tool/:runId/:file`，**需要 token 请求头**，因此 `<img>` 标签无法直接引用——浏览器展示请用 `b64_json`（data URI）；url 适合程序化下载。
 - 生成耗时波动大（数秒到数分钟），且依赖工具自身的图像能力与配额（agy 的 `generate_image` 实测存在配额限制）；失败会带明确错误信息，可稍后重试。
 - CORS 契约：OpenAI 兼容层（含 `/v1/models`、`/v1/chat/completions`、`/v1/images/generations`）的**成功与错误响应**都会带来源白名单的 CORS 头——错误信封必须让跨域页面读到，否则浏览器拦截响应、`fetch` 只抛 `TypeError`（表现为 HTTP 0），接入方拿不到真实错误码。

@@ -84,6 +84,32 @@ export function composeInput(messages) {
   return convo.map((m) => `${label[m.role] || m.role}: ${m.content}`).join('\n\n');
 }
 
+const IMAGE_MIME_EXT = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif' };
+
+/**
+ * 多模态消息 → 附件列表（仅 data URL 内联；外链不取——UDS 通道按本机信任域设计，桥不做任意出网抓取）。
+ * 顺序即消息顺序，文件名 att-<i><ext> 由 runner 落盘到 run 工作目录。非法输入抛 BridgeError。
+ */
+export function extractAttachments(messages) {
+  const out = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const part of m.content) {
+      if (!part || part.type !== 'image_url') continue;
+      const url = part.image_url?.url;
+      if (typeof url !== 'string' || !url.startsWith('data:')) {
+        throw new BridgeError('E_BAD_REQUEST', 'image_url 仅支持 data URL（base64 内联），不支持外链');
+      }
+      const match = /^data:([a-zA-Z0-9/+.-]+);base64,([\s\S]+)$/.exec(url);
+      if (!match) throw new BridgeError('E_BAD_REQUEST', 'image_url 不是合法的 base64 data URL');
+      const ext = IMAGE_MIME_EXT[match[1].toLowerCase()];
+      if (!ext) throw new BridgeError('E_BAD_REQUEST', `不支持的图片类型：${match[1]}（支持 png / jpeg / webp / gif）`);
+      out.push({ filename: `att-${out.length}${ext}`, dataBase64: match[2] });
+    }
+  }
+  return out;
+}
+
 /**
  * 多轮请求的会话续聊输入（协议见 docs/PROTOCOL.md §7.2）：
  * 历史含 assistant 回复、且新增的是末条 user 消息时，查会话映射——命中则只发
@@ -142,7 +168,8 @@ export function createOpenAiHandlers({ config, engine, sessions = createSessionS
   async function chatCompletions(req, res, cors, { origin, tokenKey, tokenAudit }) {
     let body;
     try {
-      body = await readJsonBody(req, config.limits.maxBodyBytes);
+      // 图片以 data URL 内联，1MB 全局上限装不下：chat 端点托底 20MB（其余端点仍按全局配置）
+      body = await readJsonBody(req, Math.max(config.limits.maxBodyBytes, 20 * 1024 * 1024));
     } catch (e) {
       return sendOpenAiError(res, e, cors);
     }
@@ -152,14 +179,42 @@ export function createOpenAiHandlers({ config, engine, sessions = createSessionS
     if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.some((m) => !m || typeof m !== 'object')) {
       return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', 'messages is required（OpenAI chat 格式数组）'), cors);
     }
+    // 多模态附件：仅单轮——带 assistant 历史会让图片进会话前缀键，破坏续聊语义
+    let attachments;
+    try {
+      attachments = extractAttachments(body.messages);
+    } catch (e) {
+      return sendOpenAiError(res, e, cors);
+    }
+    if (attachments.length && body.messages.some((m) => m?.role === 'assistant')) {
+      return sendOpenAiError(res, new BridgeError('E_BAD_REQUEST', '带图片附件的请求仅支持单轮（messages 中不能包含 assistant 历史）'), cors);
+    }
+    // model 斜杠约定："<toolId>/<cliModel>"（如 agy/claude-sonnet-4-6）→ 工具 + --model 选项；
+    // 前缀不是已知工具 id 时整体视为 toolId（保持旧行为的 tool-not-found 报错）
+    let toolId = body.model;
+    const slash = body.model.indexOf('/');
+    if (slash > 0 && engine.listTools().some((t) => t.id === body.model.slice(0, slash))) {
+      toolId = body.model.slice(0, slash);
+    }
     // 多轮自动会话续聊：命中历史前缀 → 只发新增消息 + --conversation（见 resolveConversationInput）
-    const { input, conversationId: resumedId } = resolveConversationInput({ model: body.model, messages: body.messages, sessions });
+    const { input: baseInput, conversationId: resumedId } = resolveConversationInput({ model: body.model, messages: body.messages, sessions });
+    // 附件清单：{attachments} 占位符由 runner 在落盘后替换为绝对路径（相对路径实测会被 agent 解析到 $HOME）
+    const input = attachments.length
+      ? `${baseInput}\n\n[随附图片文件（本机文件，先用 view_file 查看全部图片再回答）]\n{attachments}`
+      : baseInput;
     const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const created = Math.floor(Date.now() / 1000);
+    const options = {};
+    if (resumedId) options.conversationId = resumedId;
+    if (toolId !== body.model) options.model = body.model.slice(slash + 1);
+    if (body.response_format?.type === 'json_schema' && body.response_format.json_schema?.schema) {
+      options.jsonSchema = JSON.stringify(body.response_format.json_schema.schema);
+    }
     const runOpts = {
-      toolId: body.model,
+      toolId,
       input,
-      options: resumedId ? { conversationId: resumedId } : undefined,
+      options: Object.keys(options).length ? options : undefined,
+      attachments: attachments.length ? attachments : undefined,
       origin,
       tokenKey,
       tokenAudit,

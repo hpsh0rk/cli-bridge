@@ -14,7 +14,7 @@ export function isTerminalStatus(status) {
  */
 export function createEngine({ config, registry, scheduler, runs, audit }) {
   /** 校验并解析一次运行请求；非法抛 BridgeError。返回适配器声明与有效超时。 */
-  function validateRunRequest({ toolId, input, options, timeoutMs, mode }) {
+  function validateRunRequest({ toolId, input, options, timeoutMs, mode, attachments }) {
     const decl = registry.get(toolId);
     if (!decl) throw new BridgeError('E_TOOL_NOT_FOUND', `工具不存在：${toolId}`);
     // 层①工具白名单（默认全关）
@@ -30,6 +30,29 @@ export function createEngine({ config, registry, scheduler, runs, audit }) {
     if (typeof input !== 'string' || input.length === 0) {
       throw new BridgeError('E_BAD_REQUEST', 'input 必须是非空字符串', {
         detail: [{ field: 'input', problem: '必填且为非空字符串' }],
+      });
+    }
+    if (attachments !== undefined) {
+      const cap = decl.attachments;
+      if (!cap) {
+        throw new BridgeError('E_BAD_REQUEST', `工具 ${toolId} 不支持附件`, { detail: [{ field: 'attachments', problem: '该适配器未声明 attachments 能力' }] });
+      }
+      if (!Array.isArray(attachments) || attachments.length === 0) {
+        throw new BridgeError('E_BAD_REQUEST', 'attachments 必须是非空数组', { detail: [{ field: 'attachments', problem: '必须是数组' }] });
+      }
+      if (attachments.length > cap.maxCount) {
+        throw new BridgeError('E_BAD_REQUEST', `附件数量超过上限 ${cap.maxCount}`, { detail: [{ field: 'attachments', problem: `最多 ${cap.maxCount} 个` }] });
+      }
+      attachments.forEach((att, i) => {
+        const bad = (problem) => new BridgeError('E_BAD_REQUEST', `附件 ${i} 非法：${problem}`, { detail: [{ field: `attachments.${i}`, problem }] });
+        if (!att || typeof att !== 'object' || Array.isArray(att)) throw bad('必须是对象');
+        if (typeof att.filename !== 'string' || !att.filename) throw bad('filename 必填');
+        if (typeof att.dataBase64 !== 'string' || !att.dataBase64) throw bad('dataBase64 必填');
+        const ext = att.filename.slice(att.filename.lastIndexOf('.')).toLowerCase();
+        if (!cap.extensions.includes(ext)) throw bad(`扩展名须为 ${cap.extensions.join(' / ')} 之一`);
+        const decoded = Buffer.from(att.dataBase64, 'base64');
+        if (!decoded.length) throw bad('dataBase64 无法解码');
+        if (decoded.length > cap.maxBytes) throw bad(`解码后超过 ${cap.maxBytes} 字节上限`);
       });
     }
     if (options !== undefined && (typeof options !== 'object' || options === null || Array.isArray(options))) {
@@ -126,14 +149,14 @@ export function createEngine({ config, registry, scheduler, runs, audit }) {
      * mode='stream'：走流式执行器，每个增量文本经 onDelta(text) 回调（OpenAI 兼容层用）；
      * mode='image' ：走图片执行器（文件收割），终态 output 为图片文件名数组。
      */
-    async run({ toolId, input, options, wait = true, timeoutMs, origin, tokenKey, tokenAudit, mode, onDelta, onCreate }) {
+    async run({ toolId, input, options, wait = true, timeoutMs, origin, tokenKey, tokenAudit, mode, attachments, onDelta, onCreate }) {
       // 频控先于其余校验：让扫描/滥用烧掉自己的预算
       scheduler.checkRateLimit(tokenKey ?? null);
       // 队列容量同步预检：保证 wait:false 的提交方也能拿到 E_BUSY（而非 202 后无声失败）
       if (scheduler.waiting >= scheduler.queueDepth) {
         throw new BridgeError('E_BUSY', `任务队列已满（${scheduler.queueDepth}），请稍后重试`, { retryAfterMs: 2000 });
       }
-      const { decl, effectiveTimeoutMs } = validateRunRequest({ toolId, input, options, timeoutMs, mode });
+      const { decl, effectiveTimeoutMs } = validateRunRequest({ toolId, input, options, timeoutMs, mode, attachments });
       const run = runs.create({ toolId, origin });
       run.mode = mode || null;
       if (onCreate) {
@@ -149,10 +172,10 @@ export function createEngine({ config, registry, scheduler, runs, audit }) {
       };
       const exec =
         mode === 'image'
-          ? (d) => execAdapterLive({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, image: d.image, isCancelled, onSpawn })
+          ? (d) => execAdapterLive({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, image: d.image, attachments, isCancelled, onSpawn })
           : mode === 'stream'
-            ? (d) => execAdapterLive({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, onDelta, isCancelled, onSpawn })
-            : (d) => execAdapter({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, isCancelled, onSpawn });
+            ? (d) => execAdapterLive({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, onDelta, attachments, isCancelled, onSpawn })
+            : (d) => execAdapter({ decl: d, input, options, timeoutMs: effectiveTimeoutMs, runId: run.runId, attachments, isCancelled, onSpawn });
       run.done = runOne(run, { input, options, timeoutMs: effectiveTimeoutMs, tokenAudit, exec });
       run.done.catch(() => {}); // 结果经 run.failure / run.result 读取，防 unhandled rejection
       if (!wait) return { async: true, data: { runId: run.runId, status: run.status } };

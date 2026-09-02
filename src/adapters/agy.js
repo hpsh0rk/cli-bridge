@@ -21,6 +21,15 @@
  *   实测第二轮 input_tokens 33981 中 cache_read_tokens 24480。注意 usage 口径：
  *   input_tokens 不含缓存命中部分（两者相加才是完整 prompt），result.usage 是会话累计值。
  *   续聊不存在的会话 id 不报错：stderr 警告后开新会话（上下文丢失但仍 SUCCESS）。
+ *
+ * 附件/视觉（实测 2026-09-02）：
+ *   - print 模式读文件必须 --dangerously-skip-permissions：非交互下权限请求自动 deny，
+ *     agent 会静默放弃读图并返回空 response（status 仍是 SUCCESS，极具迷惑性）；
+ *   - Gemini 系模型的 view_file 后端有 bug（"timeout waiting for response" 稳定复现，
+ *     读文本文件同样超时；run_command 正常），读图必须 --model claude-sonnet-4-6；
+ *   - 相对路径解析不可靠（claude 把 ./x 解析到 $HOME），附件清单必须注入绝对路径；
+ *   - claude 模型的 generate_image 产物写 ~/.gemini/antigravity-cli/scratch/（非 brain 目录），
+ *     image.searchDirs 已加 scratch 兜底；--json-schema 在 stream-json 模式作用于最终 result。
  */
 export default {
   id: 'agy',
@@ -54,10 +63,21 @@ export default {
     extensions: ['.png', '.jpg', '.jpeg', '.webp'],
     fileStableMs: 2000,
     toolName: 'generate_image',
-    searchDirs: ['~/.gemini/antigravity-cli/brain'],
+    searchDirs: ['~/.gemini/antigravity-cli/brain', '~/.gemini/antigravity-cli/scratch'],
   },
-  capabilities: { text: true, image: true, stream: true, conversation: true },
+  /** 附件（vision 输入）：写入 run 工作目录 attachments/ 子目录（避免被图片收割误认成产物），清单经 {attachments} 占位符注入绝对路径；带附件时自动挂 skip-permissions（读文件需要） */
+  attachments: {
+    extensions: ['.png', '.jpg', '.jpeg', '.webp', '.gif'],
+    maxCount: 4,
+    maxBytes: 8 * 1024 * 1024,
+    extraArgs: ['--dangerously-skip-permissions'],
+  },
+  capabilities: { text: true, image: true, stream: true, conversation: true, attachments: true },
   limits: { timeoutMs: 300000, concurrency: 1, outputMaxBytes: 8388608 },
-  options: [{ name: 'conversationId', flag: '--conversation', type: 'string' }],
+  options: [
+    { name: 'conversationId', flag: '--conversation', type: 'string' },
+    { name: 'model', flag: '--model', type: 'string' },
+    { name: 'jsonSchema', flag: '--json-schema', type: 'string' },
+  ],
 };
 
