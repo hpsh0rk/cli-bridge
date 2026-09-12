@@ -169,7 +169,7 @@ export function execAdapter({ decl, input, options, timeoutMs, runId, attachment
       return reject(e);
     }
     let args = decl.run.args.map((a) => (a === '{input}' ? finalInput : a));
-    if (attArgs.length) args = args.concat(attArgs);
+    for (const a of attArgs) if (!args.includes(a)) args.push(a); // 与 Live 路径同口径：去重防重复 flag
     args = args.concat(optionsToArgs(decl, options));
 
     let child;

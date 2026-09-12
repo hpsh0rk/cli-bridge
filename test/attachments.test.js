@@ -254,3 +254,24 @@ test('images/generations：外链 image 400；image + n=1 语义保持', async (
   assert.equal(bad.status, 400);
   assert.equal(bad.json.error.code, 'E_BAD_REQUEST');
 });
+
+test('engine 附件校验：超数量 / 超大小 / 非法扩展名 拒绝路径', async (t) => {
+  const cfg = visionConfig();
+  cfg.adapters.vis.attachments = { extensions: ['.png'], maxCount: 1, maxBytes: 16, extraArgs: [] };
+  const b = await startBridge(t, { configPatch: cfg });
+  await assert.rejects(
+    b.engine.run({ toolId: 'vis', input: 'x', mode: 'stream', attachments: [
+      { filename: 'att-0.png', dataBase64: PNG_BASE64 },
+      { filename: 'att-1.png', dataBase64: PNG_BASE64 },
+    ] }),
+    (e) => e instanceof BridgeError && /数量超过上限/.test(e.message)
+  );
+  await assert.rejects(
+    b.engine.run({ toolId: 'vis', input: 'x', mode: 'stream', attachments: [{ filename: 'att-0.png', dataBase64: Buffer.alloc(32, 1).toString('base64') }] }),
+    (e) => e instanceof BridgeError && /上限/.test(e.message)
+  );
+  await assert.rejects(
+    b.engine.run({ toolId: 'vis', input: 'x', mode: 'stream', attachments: [{ filename: 'att-0.gif', dataBase64: PNG_BASE64 }] }),
+    (e) => e instanceof BridgeError && /扩展名/.test(e.message)
+  );
+});
