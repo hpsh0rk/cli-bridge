@@ -59,7 +59,9 @@ export default {
     },
   },
   image: {
-    extraArgs: ['--dangerously-skip-permissions'],
+    // --print-timeout 8m：带参考图的生成链路（读图→generate_image）实测常逼近甚至超过 5 分钟，
+    // agy print 模式默认 5m 自毙会先于桥超时失败（v0.9.7 实测 E_TIMEOUT @300s）
+    extraArgs: ['--dangerously-skip-permissions', '--print-timeout', '8m'],
     extensions: ['.png', '.jpg', '.jpeg', '.webp'],
     fileStableMs: 2000,
     toolName: 'generate_image',
@@ -73,7 +75,7 @@ export default {
     extraArgs: ['--dangerously-skip-permissions'],
   },
   capabilities: { text: true, image: true, stream: true, conversation: true, attachments: true },
-  limits: { timeoutMs: 300000, concurrency: 1, outputMaxBytes: 8388608 },
+  limits: { timeoutMs: 480000, concurrency: 1, outputMaxBytes: 8388608 },
   options: [
     { name: 'conversationId', flag: '--conversation', type: 'string' },
     { name: 'model', flag: '--model', type: 'string' },
